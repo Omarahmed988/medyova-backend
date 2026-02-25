@@ -1,3 +1,6 @@
+# Spec-Kit agent folder (may contain credentials/tokens)
+.agent/
+
 # Logs
 logs
 *.log

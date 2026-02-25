@@ -1,0 +1,29 @@
+{
+    "name": "medyova-backend",
+    "version": "0.1.0",
+    "description": "Medyova Backend — Demand Router + Trust Layer + Rare Priority Engine",
+    "main": "server.js",
+    "license": "MIT",
+    "author": "Medyova",
+    "engines": {
+        "node": ">=22.0.0"
+    },
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node server.js",
+        "test": "jest",
+        "test:coverage": "jest --coverage"
+    },
+    "dependencies": {
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.7",
+        "express": "^4.21.2",
+        "helmet": "^8.0.0",
+        "morgan": "^1.10.0",
+        "pg": "^8.13.3"
+    },
+    "devDependencies": {
+        "jest": "^29.7.0",
+        "supertest": "^7.0.0"
+    }
+}
