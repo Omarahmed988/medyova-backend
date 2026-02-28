@@ -22,6 +22,8 @@ node_modules/
 
 # dotenv environment variable files
 .env
+.env.dev
+.env.prod
 .env.local
 .env.*.local
 
