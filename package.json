@@ -13,9 +13,9 @@
         "dev": "node server.js",
         "test": "jest",
         "test:coverage": "jest --coverage",
-        "migrate": "node-pg-migrate up --migrations-dir migrations",
-        "migrate:down": "node-pg-migrate down --migrations-dir migrations",
-        "migrate:create": "node-pg-migrate create --migrations-dir migrations"
+        "migrate": "node scripts/migrate.js up",
+        "migrate:down": "node scripts/migrate.js down",
+        "migrate:create": "node scripts/migrate.js create"
     },
     "dependencies": {
         "cors": "^2.8.5",
