@@ -12,7 +12,10 @@
         "start": "node server.js",
         "dev": "node server.js",
         "test": "jest",
-        "test:coverage": "jest --coverage"
+        "test:coverage": "jest --coverage",
+        "migrate": "node-pg-migrate up --migrations-dir migrations",
+        "migrate:down": "node-pg-migrate down --migrations-dir migrations",
+        "migrate:create": "node-pg-migrate create --migrations-dir migrations"
     },
     "dependencies": {
         "cors": "^2.8.5",
@@ -20,6 +23,7 @@
         "express": "^4.21.2",
         "helmet": "^8.0.0",
         "morgan": "^1.10.0",
+        "node-pg-migrate": "^8.0.4",
         "pg": "^8.13.3"
     },
     "devDependencies": {
