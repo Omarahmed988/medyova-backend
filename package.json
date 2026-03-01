@@ -11,6 +11,8 @@
     "scripts": {
         "start": "node server.js",
         "dev": "node server.js",
+        "worker": "node src/workers/routing-worker.js",
+        "worker:dev": "node src/workers/routing-worker.js",
         "test": "jest",
         "test:coverage": "jest --coverage",
         "migrate": "node scripts/migrate.js up",
