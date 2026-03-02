@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * Offer Acceptance Service — Phase 6
+ * Offer Acceptance Service — Phase 6 + Phase 7
  *
- * Implements the 7-step atomic acceptance transaction
- * per Offer Acceptance Spec v2 §2.3.
+ * Implements the 8-step atomic acceptance transaction:
+ *   Steps 1-7: Acceptance Spec v2 §2.3
+ *   Step 8:    Order creation (Order Lifecycle Spec v2 §2.2)
  *
  * Lock order: requests → offers (deadlock prevention rule §2.3).
  * No compensating transactions — uses in-transaction re-verification.
@@ -16,11 +17,20 @@
  *   - Accepting the target offer
  *   - Rejecting all other pending offers
  *   - Transitioning request.state to 'accepted'
+ *   - Creating the order row (Step 8)
  *
  * It does NOT handle auth or ownership — that is the route's job.
  */
 
 const { pool } = require('../config/db');
+
+/**
+ * Commission rate as a percentage. Configurable via environment variable.
+ * Default: 10.00 (10%)
+ */
+const COMMISSION_RATE_PERCENT = parseFloat(
+    process.env.COMMISSION_RATE_PERCENT || '10.00'
+);
 
 /**
  * Error codes for acceptance failures (Spec v2 §2.4).
@@ -39,7 +49,7 @@ const ERROR_CODES = {
  *
  * @param {string} requestId - UUID of the request
  * @param {string} offerId - UUID of the offer to accept
- * @returns {Promise<{success: boolean, idempotent?: boolean, error_code?: string, message?: string}>}
+ * @returns {Promise<{success: boolean, idempotent?: boolean, order_id?: string, error_code?: string, message?: string}>}
  */
 async function acceptOffer(requestId, offerId) {
     const client = await pool.connect();
@@ -131,9 +141,40 @@ async function acceptOffer(requestId, offerId) {
             [requestId]
         );
 
+        // ── Step 8: Create order from accepted offer (Order Spec v2 §2.2) ─
+        const orderResult = await client.query(
+            `INSERT INTO orders (
+                id, request_id, offer_id, pharmacy_id, user_id,
+                total_price, delivery_fee,
+                commission_rate, commission_amount, commission_status,
+                status, created_at, updated_at
+            )
+            SELECT
+                gen_random_uuid(),
+                o.request_id,
+                o.id,
+                o.pharmacy_id,
+                r.user_id,
+                o.total_price,
+                o.delivery_fee,
+                $2,
+                ROUND(o.total_price * $2 / 100, 2),
+                'pending',
+                'pending',
+                now(),
+                now()
+            FROM offers o
+            JOIN requests r ON r.id = o.request_id
+            WHERE o.id = $1
+            RETURNING id`,
+            [offerId, COMMISSION_RATE_PERCENT]
+        );
+
+        const orderId = orderResult.rows[0]?.id;
+
         await client.query('COMMIT');
 
-        return { success: true, idempotent: false };
+        return { success: true, idempotent: false, order_id: orderId };
     } catch (err) {
         await client.query('ROLLBACK').catch(() => { });
         throw err;
@@ -145,4 +186,5 @@ async function acceptOffer(requestId, offerId) {
 module.exports = {
     acceptOffer,
     ERROR_CODES,
+    COMMISSION_RATE_PERCENT,
 };

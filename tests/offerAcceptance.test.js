@@ -128,7 +128,7 @@ describe('POST /requests/:requestId/offers/:offerId/accept', () => {
                 rows: [{ user_id: MOCK_USER_ID }],
             });
 
-            // Transaction steps
+            // Transaction steps (8 total now, including Step 8: order INSERT)
             mockClient.query
                 .mockResolvedValueOnce({})                                          // BEGIN
                 .mockResolvedValueOnce({ rows: [{ state: 'fully_offered' }] })      // Step 1: lock request
@@ -136,6 +136,7 @@ describe('POST /requests/:requestId/offers/:offerId/accept', () => {
                 .mockResolvedValueOnce({ rowCount: 1 })                             // Step 5: accept offer
                 .mockResolvedValueOnce({ rowCount: 2 })                             // Step 6: reject others
                 .mockResolvedValueOnce({ rowCount: 1 })                             // Step 7: transition request
+                .mockResolvedValueOnce({ rows: [{ id: 'new-order-id' }] })          // Step 8: INSERT order
                 .mockResolvedValueOnce({});                                         // COMMIT
 
             const res = await authAgent()
@@ -309,6 +310,7 @@ describe('POST /requests/:requestId/offers/:offerId/accept', () => {
                 .mockResolvedValueOnce({ rowCount: 1 })
                 .mockResolvedValueOnce({ rowCount: 0 })
                 .mockResolvedValueOnce({ rowCount: 1 })
+                .mockResolvedValueOnce({ rows: [{ id: 'order-id' }] })              // Step 8
                 .mockResolvedValueOnce({});                                         // COMMIT
 
             await authAgent()
