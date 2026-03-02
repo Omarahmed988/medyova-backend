@@ -1,8 +1,8 @@
 # Routing Worker — Architectural Specification
 
-> **Status**: Draft v2 — Clarifications Applied, Pending Final Approval  
+> **Status**: v4 — Marketplace Fairness Model (Final)  
 > **Phase**: 4 (Routing Worker)  
-> **Depends on**: Layer 3 (routing_jobs, routing_waves), Routing Engine Spec v2
+> **Depends on**: Layer 3 (routing_jobs, routing_waves), Routing Engine Spec v4
 
 ---
 
@@ -92,6 +92,7 @@ Poll again
 | Parameter | Default | Source |
 |-----------|---------|--------|
 | `WORKER_POLL_INTERVAL_MS` | `3000` | Environment variable |
+| `WORKER_HEARTBEAT_INTERVAL_MS` | `500` | Environment variable |
 | `WORKER_STALE_JOB_THRESHOLD_SEC` | `600` | Environment variable |
 | `WORKER_MAX_CONSECUTIVE_ERRORS` | `5` | Environment variable |
 
@@ -171,7 +172,7 @@ UPDATE routing_jobs SET updated_at = now()
 WHERE id = <job_id> AND status = 'active'
 ```
 
-This prevents other workers from mistakenly identifying the job as stale during long wave windows. The heartbeat runs once per poll cycle (≤1 second intervals) within the wave wait loop.
+This prevents other workers from mistakenly identifying the job as stale during long wave windows. The heartbeat interval is configurable via `WORKER_HEARTBEAT_INTERVAL_MS` (default 500ms).
 
 Scope: One wave's setup. If this transaction fails, the wave was never created (or already exists via ON CONFLICT), and the worker can safely retry.
 
@@ -243,24 +244,33 @@ All transactions use the default PostgreSQL isolation level (`READ COMMITTED`). 
 
    e. Mark wave 'active', set started_at and expires_at
 
-   f. Wait for window_duration_sec using sub-second polling:
-      - Sleep in ≤1 second intervals (e.g., 500ms)
+   f. Wait for FULL window_duration_sec (NEVER terminate early):
+      - Sleep in configurable intervals (WORKER_HEARTBEAT_INTERVAL_MS, default 500ms)
       - Each cycle: check request.expires_at, update routing_jobs.updated_at (heartbeat)
-      - Never use full blocking sleep for the entire window duration
+      - Even if a full coverage offer arrives early, the wave continues
+      - This ensures fair competition within the tier
 
-   g. Check if any offers exist for this request (EXISTS query)
+   g. Wave window elapsed:
+      - Count offers received during window (informational snapshot for offers_received)
+      - Mark wave 'completed'
 
-   h. Mark wave 'completed'
-
-   i. Check sufficient offer rule (EXISTS, not COUNT):
-      → SELECT EXISTS(SELECT 1 FROM offers WHERE request_id = <request_id>)
-      → TRUE: mark job 'completed', stop
+   h. Check full coverage escalation stop (EXISTS, not COUNT):
+      → SELECT EXISTS(
+          SELECT 1 FROM offers
+          WHERE request_id = <request_id>
+          AND coverage_ratio = 100
+        )
+      → TRUE: mark job 'completed', update request state to 'fully_offered', STOP
       → FALSE: continue to next tier
 
-3. All tiers exhausted with no offers:
+3. All tiers exhausted:
+   → Check if ANY offers exist (full or partial)
+   → If partial offers exist: request.state = 'partially_offered'
+   → If no offers exist: request.state = 'expired' (if TTL hit) or 'partially_offered'
    → Mark job 'completed'
-   → Update request.state accordingly
 ```
+
+> **No legacy “stop at ≥1 offer” logic.** Full coverage is the only escalation stop condition. Partial offers never halt escalation.
 
 ### Tier Configuration Source
 
@@ -277,17 +287,37 @@ ORDER BY rank ASC
 
 The column is `NOT NULL` with no ENV fallback. Every tier **must** have an explicit `window_duration_sec` value. This is an intentional routing policy coupling — wave timing is a tier-level governance decision, not a worker configuration detail. If a tier row exists without this value, the migration must reject it via `NOT NULL`.
 
-### Sufficient Offer Check
+### Full Coverage Check
 
-The check uses an `EXISTS` query (not `COUNT(*)`) for optimal performance:
+The escalation stop check uses an `EXISTS` query targeting **full coverage offers only**:
 
 ```
 SELECT EXISTS(
-  SELECT 1 FROM offers WHERE request_id = <request_id>
-) AS has_offers
+  SELECT 1 FROM offers
+  WHERE request_id = <request_id>
+  AND coverage_ratio = 100
+) AS has_full_coverage
 ```
 
-If `has_offers = true`, escalation stops and the job completes. `EXISTS` short-circuits after the first match — no need to scan all offers.
+If `has_full_coverage = true`, escalation stops and the job completes with `request.state = 'fully_offered'`. `EXISTS` short-circuits after the first match.
+
+> **Partial offers never stop escalation.** Only full coverage offers halt tier progression. This prevents a scenario where a single partial offer blocks better pharmacies in lower tiers from competing.
+
+### Request State Determination
+
+When routing completes (all tiers exhausted or full coverage found), the worker determines the request state:
+
+```
+1. SELECT EXISTS(SELECT 1 FROM offers WHERE request_id = ? AND coverage_ratio = 100.00)
+   → TRUE: request.state = 'fully_offered'
+
+2. SELECT EXISTS(SELECT 1 FROM offers WHERE request_id = ?)
+   → TRUE: request.state = 'partially_offered'
+
+3. Neither (0 offers): request.state = 'expired'
+```
+
+> **No ambiguity:** 0 offers always means `expired`. The `partially_offered` state requires at least one offer to exist.
 
 ### Expiry Check
 
@@ -377,7 +407,8 @@ All log entries must be structured JSON with consistent fields:
 | Wave skipped | `info` | `job_id`, `wave_number`, `tier_name`, `reason: 'no_pharmacies'` |
 | Wave completed | `info` | `job_id`, `wave_number`, `offers_received`, `duration_ms` |
 | Escalation triggered | `info` | `job_id`, `from_wave`, `to_wave`, `reason` |
-| Sufficient offer reached | `info` | `job_id`, `total_offers`, `completed_at_wave` |
+| Full coverage reached | `info` | `job_id`, `total_full_coverage_offers`, `completed_at_wave` |
+| No full coverage (escalating) | `info` | `job_id`, `wave_number`, `partial_offers_count` |
 | Job completed | `info` | `job_id`, `final_status`, `total_waves`, `total_offers`, `duration_ms` |
 | Job expired | `warn` | `job_id`, `request_id`, `expired_at`, `waves_completed` |
 | Job failed | `error` | `job_id`, `error_message`, `failed_at_wave`, `stack` |
@@ -409,6 +440,19 @@ The worker must expose a simple health indicator (not HTTP — file-based or std
 > This must be added via a new migration before worker implementation begins.
 > The worker must snapshot this value into `routing_waves.window_duration_sec` at wave creation time.
 
+### Schema Dependency: `offers.coverage_ratio`
+
+> [!IMPORTANT]
+> The marketplace fairness model requires a `coverage_ratio` column on the `offers` table.
+> 
+> **Proposed addition to `offers` (Layer 2 amendment):**
+> ```
+> coverage_ratio  NUMERIC(5,2)  NOT NULL  CHECK(coverage_ratio >= 0 AND coverage_ratio <= 100)
+> ```
+>
+> Full coverage is strictly defined as `coverage_ratio = 100.00`.
+> This must be added via a Layer 2 amendment migration before worker Phase 4B implementation.
+
 ### Why `window_duration_sec` Belongs in `tiers`
 
 This is an **intentional routing policy coupling**. Wave timing is a tier-level governance decision:
@@ -425,8 +469,56 @@ Therefore:
 
 ---
 
+## 8. Marketplace Exposure Policy
+
+This section governs what the **client sees**, not what the worker does. The worker stores all offers; the API layer filters visibility.
+
+### Offer Visibility Rules
+
+| Rule | Value |
+|------|-------|
+| Default visible offers | 2 |
+| Maximum visible offers | 3 |
+| Show all offers | **Never** |
+
+### Two-Level Ranking Model
+
+**Level 1 — Coverage Classification:**
+- If **full coverage** offers exist (`coverage_ratio = 100%`) → show only full coverage offers.
+- If **no full coverage** offers exist → show partial offers.
+- Never mix full and partial in the visible set.
+
+**Level 2 — Composite Score (within coverage level):**
+
+| Factor | Weight | Source |
+|--------|--------|--------|
+| `trust_score` | Primary | `pharmacies.trust_score` |
+| `acceptance_rate` | Secondary | `pharmacies.acceptance_rate` |
+| Response speed | Tertiary | Time between wave start and offer submission |
+
+> **Price is NOT a ranking factor.** Price is visible to the client but never influences the ordering algorithm. This prevents a race to the bottom and maintains pharmacy trust incentives.
+
+### Stored vs Visible
+
+- All offers are **stored** in the `offers` table for audit, trust engine metrics, and analytics.
+- Only the top 2–3 offers (per the ranking model) are **visible** to the client via the API.
+- Offers beyond the top 3 are hidden but not deleted.
+
+### Wave Fairness Rule
+
+Even if a full coverage offer appears early in a wave:
+
+1. **DO NOT** close the wave immediately.
+2. **Allow** all remaining pharmacies in the same tier to submit offers until the window ends.
+3. **Prevent** escalation to the next tier after wave completion if full coverage exists.
+
+A pharmacy that submits a better offer 30 seconds before the window closes is treated equally to one that submitted immediately. This is the core marketplace fairness guarantee.
+
+---
+
 > **⛔ REVIEW GATE**
 >
-> This specification is complete. No code, no implementation.
+> This specification reflects the Marketplace Fairness Model (v4 — Final).
+> No code, no implementation.
 >
 > Awaiting architectural review and explicit approval before writing any worker code.

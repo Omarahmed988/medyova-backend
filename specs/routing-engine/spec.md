@@ -1,6 +1,6 @@
 # Routing Engine — Architectural Specification
 
-> **Status**: Draft v2 — Clarifications Applied, Pending Final Approval  
+> **Status**: v4 — Marketplace Fairness Model (Final)  
 > **Layer**: 3 (Routing Infrastructure)  
 > **Depends on**: Layer 1 (zones, tiers, pharmacies), Layer 2 (users, requests, request_items, offers)
 
@@ -43,14 +43,16 @@ These are not business logic details — they are **marketplace rules** that det
 | Wave | Tier   | Behavior |
 |------|--------|----------|
 | 1    | Gold   | First exposure window. Only Gold-tier pharmacies in the request's zone are notified. |
-| 2    | Silver | If Gold-tier window expires without sufficient offers, Silver-tier pharmacies are added. |
+| 2    | Silver | If Gold-tier window completes without full coverage offers, Silver-tier pharmacies are added. |
 | 3    | Bronze | Final escalation. All remaining active pharmacies in the zone are exposed. |
 
 Each wave has a **window duration snapshotted from tier-level configuration** at wave creation time (e.g., Gold = 300s, Silver = 180s). The routing engine must track which wave is active, when it started, and when to escalate.
 
 > **Escalation depth** is not hardcoded. The number of waves is derived dynamically from the count of active tiers ordered by `tiers.rank ASC`. Adding or removing tiers automatically adjusts the escalation depth.
 
-> **Sufficient offer rule (MVP):** Escalation stops once **at least one offer** is received for the request. If the current wave's window elapses and `offers_received >= 1`, the job completes without escalating further.
+> **Escalation stop condition:** Escalation stops when at least one **full coverage** offer exists at the end of the current wave window, OR all active tiers are exhausted. A wave **never terminates early** — the full window must elapse to allow fair competition within the tier. This is a marketplace fairness rule, not a first-response-wins system.
+
+> **Termination guarantee:** Routing always terminates. The number of waves is bounded by the count of active tiers. Each wave has a finite window duration. No infinite loops are possible.
 
 ### Rare Request Cross-Zone Logic
 
@@ -122,7 +124,7 @@ One row per escalation wave within a routing job. Tracks tier-level routing exec
 | `tier_id` | UUID | NO | — | FK → `tiers(id)`, ON DELETE RESTRICT | Which tier this wave targets |
 | `status` | `wave_status_enum` | NO | `'pending'` | | |
 | `pharmacies_targeted` | INTEGER | NO | `0` | CHECK >= 0 | Count of pharmacies notified in this wave |
-| `offers_received` | INTEGER | NO | `0` | CHECK >= 0 | Count of offers received during this wave |
+| `offers_received` | INTEGER | NO | `0` | CHECK >= 0 | **Informational snapshot only** — not used for escalation decisions |
 | `window_duration_sec` | INTEGER | NO | — | CHECK > 0 | Snapshotted from tier config at wave creation time |
 | `started_at` | TIMESTAMPTZ | YES | — | | When the wave window opened |
 | `expires_at` | TIMESTAMPTZ | YES | — | | `started_at + window_duration_sec` |
@@ -137,6 +139,20 @@ One row per escalation wave within a routing job. Tracks tier-level routing exec
 - Composite: `(job_id, wave_number)` — UNIQUE constraint
 
 **Delete policy:** CASCADE from `routing_jobs`.
+
+> **Note on `offers_received`:** This field is an informational snapshot written at wave completion for observability and audit purposes. It is **never** used for escalation decisions. All escalation logic relies exclusively on `EXISTS` queries against the `offers` table filtering by `coverage_ratio = 100.00`.
+
+### 2.5 Layer 2 Amendment: `offers.coverage_ratio`
+
+The marketplace fairness model requires a `coverage_ratio` column on the `offers` table:
+
+| Field | Type | Nullable | Default | Constraints | Notes |
+|-------|------|----------|---------|-------------|-------|
+| `coverage_ratio` | NUMERIC(5,2) | NO | — | CHECK >= 0 AND <= 100 | Percentage of request items covered by this offer |
+
+**Full coverage** is strictly defined as `coverage_ratio = 100.00`. Any value below 100.00 is considered partial.
+
+This column must be added via a Layer 2 amendment migration before worker Phase 4B implementation begins.
 
 ---
 
@@ -162,48 +178,52 @@ User broadcasts request
            │
            ▼
   ┌─────────────────────────────────────┐
-  │ Start Wave 1 (Gold tier)            │
-  │ → Query pharmacies WHERE            │
-  │     zone_id = request.zone_id       │
-  │     AND tier_id = gold.id           │
-  │     AND is_active = true            │
-  │   ORDER BY trust_score DESC         │
-  │ → Set wave.pharmacies_targeted      │
-  │ → Set wave.started_at = now()       │
-  │ → Set wave.expires_at = now() + N   │
+  │ Start Wave N (tier by rank ASC)        │
+  │ → Query eligible pharmacies             │
+  │ → ORDER BY trust_score DESC             │
+  │ → Set pharmacies_targeted, started_at   │
   └────────┬────────────────────────────┘
            │
            ▼
-  ┌─────────────────┐
-  │ Wait window      │
-  │ (5 min default)  │
-  └────────┬────────┘
+  ┌─────────────────────────────────────┐
+  │ Wait FULL window duration               │
+  │ (NEVER terminate early)                 │
+  │ Heartbeat routing_jobs.updated_at       │
+  │ Check request.expires_at each cycle     │
+  └────────┬────────────────────────────┘
            │
-       ┌───┴───┐
-       │       │
-   ≥1 offer  No offers
-   received  received
-       │       │
-       ▼       ▼
-  ┌────────┐ ┌──────────────┐
-  │ STOP   │ │ Escalate to  │
-  │ routing│ │ next tier     │
-  │ job    │ │ wave          │
-  │ done   │ └──────┬───────┘
-  └────────┘        │
-                    ▼
-              (repeat cycle)
-                    │
-                    ▼
-  ┌─────────────────────────────┐
-  │ All tiers exhausted OR      │
-  │ request.expires_at reached  │
-  │ OR ≥1 offer received        │
-  │                             │
-  │ → job.status = 'completed'  │
-  │   or 'expired'              │
-  │ → request.state updated     │
-  └─────────────────────────────┘
+           ▼
+  ┌─────────────────────────────────────┐
+  │ Wave window elapsed                     │
+  │ Mark wave 'completed'                   │
+  │ Count offers_received for wave           │
+  └────────┬────────────────────────────┘
+           │
+       ┌───┴─────────────┐
+       │                   │
+  Full coverage        No full coverage
+  offer exists         offer yet
+       │                   │
+       ▼                   ▼
+  ┌────────────┐    ┌──────────────┐
+  │ STOP        │    │ Escalate to  │
+  │ routing     │    │ next tier    │
+  │ job done    │    │ wave         │
+  └────────────┘    └──────┬───────┘
+                           │
+                           ▼
+                     (repeat cycle)
+                           │
+                           ▼
+  ┌─────────────────────────────────────┐
+  │ All tiers exhausted OR               │
+  │ request.expires_at reached            │
+  │                                       │
+  │ → Determine final request state:      │
+  │   full coverage → 'fully_offered'     │
+  │   partial only  → 'partially_offered' │
+  │   no offers     → 'expired'           │
+  └─────────────────────────────────────┘
 ```
 
 ### Rare Request Override
@@ -216,6 +236,56 @@ For `request.type = 'rare'`:
 2. **Tier precedence is preserved.** Gold-rare pharmacies across all zones get first window, then Silver-rare, then Bronze-rare. Tier escalation is never bypassed.
 3. **Trust score ordering is intra-tier only.** Within each wave, pharmacies are ordered by `trust_score DESC`. Trust does **not** override tier precedence — a Bronze pharmacy with trust 95 still waits for Wave 3, even if Gold pharmacies have trust 40.
 
+### Two-Level Ranking Model
+
+Offers are ranked using a two-level model:
+
+**Level 1 — Coverage Classification:**
+- **Full coverage** offers (`coverage_ratio = 100%`) are always ranked above partial offers.
+- If full coverage offers exist, only full coverage offers are considered for ranking.
+- If no full coverage offers exist, partial offers are used.
+
+**Level 2 — Composite Score (within coverage level):**
+
+| Factor | Weight | Source |
+|--------|--------|--------|
+| `trust_score` | Primary | `pharmacies.trust_score` |
+| `acceptance_rate` | Secondary | `pharmacies.acceptance_rate` |
+| Response speed | Tertiary | Time between wave start and offer submission |
+
+> **Price is NOT a routing priority factor.** Price is visible to the client but is never used in the ranking algorithm. This prevents a race to the bottom and maintains pharmacy trust incentives.
+
+### Marketplace Exposure Policy (Client Visibility)
+
+The client must see a **controlled, competitive subset** of offers, not the full list:
+
+| Rule | Value |
+|------|-------|
+| Default visible offers | 2 |
+| Maximum visible offers | 3 |
+| Show all offers | **Never** |
+
+**Visibility rules:**
+- If full coverage offers exist → show top 2–3 full coverage offers only.
+- If no full coverage offers exist → show top 2–3 partial offers.
+- Offers beyond the top 3 remain **stored but hidden** from the client.
+- Ranking within the visible set follows the Two-Level Ranking Model above.
+
+This ensures:
+- Fair exposure — pharmacies compete on trust, not on speed of response.
+- Controlled competition — showing too many offers overwhelms the client.
+- No information asymmetry — all offers are stored for audit, but the client sees only the best.
+
+### Wave Fairness Rule
+
+Even if a full coverage offer appears early in a wave:
+
+1. **DO NOT** close the wave immediately.
+2. **Allow** all remaining pharmacies in the same tier to submit offers until the window ends.
+3. **Prevent** escalation to the next tier after wave completion if full coverage exists.
+
+This maintains fair competition inside the same tier. A pharmacy that submits a better offer 30 seconds before the window closes is treated equally to one that submitted immediately.
+
 ### Trust Score Ordering Logic
 
 Within each wave, pharmacies are ordered by:
@@ -226,23 +296,27 @@ ORDER BY pharmacies.trust_score DESC
 
 Higher-trust pharmacies appear first in the notification queue. This incentivizes pharmacies to maintain high response rates, SLA compliance, and low cancellation rates.
 
-### Tier Rank Ordering Logic
-
-Waves are created in order of `tiers.rank ASC`:
-
-| `tiers.rank` | `tiers.name` | Wave Number |
-|--------------|-------------|-------------|
-| 1 | Gold | 1 |
-| 2 | Silver | 2 |
-| 3 | Bronze | 3 |
-
-This is a direct mapping. If a new tier (e.g., `Platinum`, rank 0) is added, it automatically becomes Wave 1.
-
 ### Governance Rules
 
 1. **Exclusive window.** A pharmacy only receives the request during its tier's active wave window. It cannot see requests meant for higher tiers.
 2. **Cumulative exposure.** When Wave 2 starts, Wave 1 pharmacies can still submit offers. New pharmacies (Silver) are added, not substituted.
 3. **No re-routing.** Once a routing job completes or expires, it cannot be re-opened. A new request must be created.
+4. **No early wave termination.** A wave always runs for its full `window_duration_sec`, regardless of offers received.
+5. **Full coverage stops escalation.** If a full coverage offer exists when a wave completes, no further tiers are escalated.
+
+### Request State Transitions
+
+When routing completes, the request state is determined by offer coverage:
+
+| Condition | Request State |
+|-----------|---------------|
+| ≥1 full coverage offer exists (`coverage_ratio = 100.00`) | `fully_offered` |
+| ≥1 partial offer exists, no full coverage | `partially_offered` |
+| 0 offers | `expired` |
+
+These states must be consistent across `requests.state`, `routing_jobs.status`, and `routing_waves.status`.
+
+> **No ambiguity:** If zero offers exist at routing completion, the request state is always `expired`, regardless of whether `expires_at` was reached or all tiers were simply exhausted.
 
 ---
 
@@ -259,6 +333,7 @@ This is a direct mapping. If a new tier (e.g., `Platinum`, rank 0) is added, it 
 | Pharmacy/offer counts non-negative | `CHECK(pharmacies_targeted >= 0)`, `CHECK(offers_received >= 0)` |
 | Window duration positive | `CHECK(window_duration_sec > 0)` |
 | Pricing bounds | `CHECK(total_price >= 0)`, `CHECK(delivery_fee >= 0)` on `offers` (Layer 2) |
+| Coverage ratio bounds | `CHECK(coverage_ratio >= 0 AND coverage_ratio <= 100)` on `offers` (Layer 2) |
 
 ### Application-Enforced
 
@@ -271,6 +346,10 @@ This is a direct mapping. If a new tier (e.g., `Platinum`, rank 0) is added, it 
 | `contact_phone` must match `users.phone` when `user_id` is set | Request creation handler |
 | Request is immutable after `broadcasted` state | Request update handler |
 | Cumulative exposure (earlier wave pharmacies remain eligible) | Wave pharmacy query logic |
+| No early wave termination (full window must elapse) | Wave wait loop logic |
+| Full coverage stops escalation (not any offer) | Escalation decision logic |
+| Client sees max 2–3 offers (Marketplace Exposure Policy) | Offer API response layer |
+| Request state reflects coverage level, not just offer count | Job completion logic |
 
 ### Idempotency Requirement
 
@@ -318,7 +397,7 @@ The routing worker must assume it can be interrupted at any point and restarted.
 - The wave is created with `pharmacies_targeted = 0` and immediately marked `status = 'skipped'`.
 - Escalation to the next wave happens without waiting for the window duration.
 - If all waves are skipped, the job completes with `status = 'completed'` and zero offers.
-- The request transitions to `fully_offered` (with 0 offers) or `expired` based on TTL.
+- The request transitions to `expired` (if `expires_at` reached) or remains in `partially_offered` state.
 
 ### Request Expires Mid-Wave
 
@@ -372,6 +451,7 @@ These metrics are **persisted snapshots** (as established in Layer 1), recalcula
 
 > **⛔ REVIEW GATE**
 >
-> This specification is complete. No migrations, no code, no implementation.
+> This specification reflects the Marketplace Fairness Model (v4 — Final).
+> No migrations, no code, no implementation.
 >
-> Awaiting architectural review and explicit approval before generating the Layer 3 migration draft.
+> Awaiting architectural review and explicit approval.
