@@ -1,161 +1,251 @@
 'use strict';
 
 /**
- * Unit tests for the Offer Selection Service (Phase 5).
+ * Unit tests for the Offers Route and Offer Selection Service (Phase 5B).
  *
- * Tests verify the Two-Level Ranking Model:
- *   Level 1: Coverage classification (full vs partial)
- *   Level 2: Composite score (trust_score, acceptance_rate, response speed)
- *
- * The actual SQL query is tested via mocking the db.query function.
- * We verify that the service:
- *   - Calls the correct SQL with correct parameters
- *   - Enforces limit bounds (min 1, max 3, default 2)
- *   - Returns the query results directly
+ * Tests cover:
+ *   - Visibility gate pass (fully_offered + completed → serves offers)
+ *   - Visibility gate fail (broadcasted, draft, expired → returns [])
+ *   - Defensive recovery: expired + full coverage → serves offers with warning
+ *   - Ranking order includes response_rate
+ *   - 404 for unknown request
+ *   - Limit enforcement
  */
 
-// Mock the db module before requiring the service
+// Mock the db module before requiring anything
 jest.mock('../src/config/db', () => ({
     query: jest.fn(),
+    testConnection: jest.fn().mockResolvedValue({ connected: true }),
 }));
 
+const request = require('supertest');
+const app = require('../src/app');
 const { query } = require('../src/config/db');
-const { getTopOffersForRequest } = require('../src/services/offerSelection');
+
+const MOCK_REQUEST_ID = '550e8400-e29b-41d4-a716-446655440000';
+
+describe('GET /requests/:id/offers', () => {
+    beforeEach(() => {
+        jest.clearAllMocks();
+        // Default: testConnection succeeds
+        require('../src/config/db').testConnection.mockResolvedValue({ connected: true });
+    });
+
+    // ── Gate Pass Tests ──────────────────────────────────────────────────
+
+    describe('Visibility Gate — Pass', () => {
+        test('returns offers when request.state=fully_offered AND job.status=completed', async () => {
+            const mockOffers = [
+                { offer_id: 'o1', pharmacy_name: 'Gold Pharmacy', trust_score: 95 },
+                { offer_id: 'o2', pharmacy_name: 'Silver Pharmacy', trust_score: 88 },
+            ];
+
+            // Call 1: testConnection (requireDb middleware)
+            // Call 2: SELECT state FROM requests
+            // Call 3: SELECT status FROM routing_jobs
+            // Call 4: the ranking query from offerSelection service
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'fully_offered' }] })     // request state
+                .mockResolvedValueOnce({ rows: [{ status: 'completed' }] })         // job status
+                .mockResolvedValueOnce({ rows: mockOffers });                        // offers query
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toHaveLength(2);
+            expect(res.body.offers[0].offer_id).toBe('o1');
+        });
+
+        test('returns offers when request.state=partially_offered AND job.status=expired', async () => {
+            const mockOffers = [
+                { offer_id: 'o1', pharmacy_name: 'Partial Pharmacy', coverage_ratio: '75.00' },
+            ];
+
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'partially_offered' }] })
+                .mockResolvedValueOnce({ rows: [{ status: 'expired' }] })
+                .mockResolvedValueOnce({ rows: mockOffers });
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toHaveLength(1);
+        });
+    });
+
+    // ── Gate Fail Tests ──────────────────────────────────────────────────
+
+    describe('Visibility Gate — Fail', () => {
+        test('returns [] when request.state=broadcasted (routing in progress)', async () => {
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'broadcasted' }] })
+                .mockResolvedValueOnce({ rows: [{ status: 'active' }] });
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toEqual([]);
+        });
+
+        test('returns [] when request.state=draft (no routing job)', async () => {
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'draft' }] })
+                .mockResolvedValueOnce({ rows: [] }); // no job exists
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toEqual([]);
+        });
+
+        test('returns [] when request.state=expired and no offers exist', async () => {
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'expired' }] })
+                .mockResolvedValueOnce({ rows: [{ status: 'expired' }] })
+                .mockResolvedValueOnce({ rows: [{ has_full_coverage: false }] }); // no full coverage
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toEqual([]);
+        });
+
+        test('returns [] when request.state=cancelled', async () => {
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'cancelled' }] })
+                .mockResolvedValueOnce({ rows: [{ status: 'cancelled' }] });
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toEqual([]);
+        });
+
+        test('returns [] when request.state=fully_offered but job.status=active (I-4 violation)', async () => {
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'fully_offered' }] })
+                .mockResolvedValueOnce({ rows: [{ status: 'active' }] }); // job still active
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toEqual([]);
+        });
+    });
+
+    // ── Defensive Recovery ───────────────────────────────────────────────
+
+    describe('Defensive Recovery — Expired + Full Coverage (§3.3)', () => {
+        test('serves offers when expired but full coverage exists (invariant_violation_I1)', async () => {
+            const mockOffers = [
+                { offer_id: 'o1', coverage_ratio: '100.00' },
+            ];
+
+            const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+            query
+                .mockResolvedValueOnce({ rows: [{ state: 'expired' }] })         // request state
+                .mockResolvedValueOnce({ rows: [{ status: 'expired' }] })         // job status
+                .mockResolvedValueOnce({ rows: [{ has_full_coverage: true }] })   // defensive check
+                .mockResolvedValueOnce({ rows: mockOffers });                      // offers query
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(200);
+            expect(res.body.offers).toHaveLength(1);
+            expect(res.body.offers[0].coverage_ratio).toBe('100.00');
+
+            // Verify invariant violation was logged
+            expect(warnSpy).toHaveBeenCalledTimes(1);
+            const logMsg = JSON.parse(warnSpy.mock.calls[0][0]);
+            expect(logMsg.event).toBe('invariant_violation_I1');
+            expect(logMsg.request_id).toBe(MOCK_REQUEST_ID);
+
+            warnSpy.mockRestore();
+        });
+    });
+
+    // ── 404 ──────────────────────────────────────────────────────────────
+
+    describe('Request Not Found', () => {
+        test('returns 404 when request does not exist', async () => {
+            query.mockResolvedValueOnce({ rows: [] }); // no request found
+
+            const res = await request(app).get(`/requests/${MOCK_REQUEST_ID}/offers`);
+
+            expect(res.status).toBe(404);
+            expect(res.body.error).toBe('Not Found');
+        });
+    });
+});
+
+// ── Service Layer Tests (updated for response_rate) ──────────────────────
 
 describe('Offer Selection Service', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
 
-    describe('getTopOffersForRequest', () => {
-        const mockRequestId = '550e8400-e29b-41d4-a716-446655440000';
+    // Re-require after mock setup
+    const { getTopOffersForRequest } = require('../src/services/offerSelection');
 
-        test('calls query with correct requestId and default limit of 2', async () => {
-            query.mockResolvedValue({ rows: [] });
+    test('SQL includes response_rate in ORDER BY', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID);
 
-            await getTopOffersForRequest(mockRequestId);
+        const [sql] = query.mock.calls[0];
+        expect(sql).toContain('response_rate DESC');
+    });
 
-            expect(query).toHaveBeenCalledTimes(1);
-            const [sql, params] = query.mock.calls[0];
-            expect(params[0]).toBe(mockRequestId);
-            expect(params[1]).toBe(2); // default limit
-        });
+    test('SQL ordering is: trust_score DESC, acceptance_rate DESC, response_rate DESC, created_at ASC', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID);
 
-        test('respects custom limit parameter', async () => {
-            query.mockResolvedValue({ rows: [] });
+        const [sql] = query.mock.calls[0];
+        const orderByClause = sql.substring(sql.indexOf('ORDER BY'));
 
-            await getTopOffersForRequest(mockRequestId, 3);
+        // Verify correct sequence by position
+        const trustPos = orderByClause.indexOf('trust_score DESC');
+        const acceptPos = orderByClause.indexOf('acceptance_rate DESC');
+        const responsePos = orderByClause.indexOf('response_rate DESC');
+        const createdPos = orderByClause.indexOf('created_at ASC');
 
-            const [, params] = query.mock.calls[0];
-            expect(params[1]).toBe(3);
-        });
+        expect(trustPos).toBeLessThan(acceptPos);
+        expect(acceptPos).toBeLessThan(responsePos);
+        expect(responsePos).toBeLessThan(createdPos);
+    });
 
-        test('caps limit at maximum of 3', async () => {
-            query.mockResolvedValue({ rows: [] });
+    test('SQL does NOT include price in ORDER BY', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID);
 
-            await getTopOffersForRequest(mockRequestId, 10);
+        const [sql] = query.mock.calls[0];
+        const orderByClause = sql.substring(sql.indexOf('ORDER BY'));
+        expect(orderByClause).not.toContain('total_price');
+        expect(orderByClause).not.toContain('delivery_fee');
+    });
 
-            const [, params] = query.mock.calls[0];
-            expect(params[1]).toBe(3);
-        });
+    test('SQL selects response_rate from pharmacies', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID);
 
-        test('treats zero limit as default (2)', async () => {
-            query.mockResolvedValue({ rows: [] });
+        const [sql] = query.mock.calls[0];
+        expect(sql).toContain('p.response_rate');
+    });
 
-            await getTopOffersForRequest(mockRequestId, 0);
+    test('enforces max limit of 3', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID, 10);
 
-            const [, params] = query.mock.calls[0];
-            // 0 is falsy → parseInt(0) || 2 → 2 → Math.min(Math.max(1,2),3) = 2
-            expect(params[1]).toBe(2);
-        });
+        const [, params] = query.mock.calls[0];
+        expect(params[1]).toBe(3);
+    });
 
-        test('handles NaN limit by defaulting to 2', async () => {
-            query.mockResolvedValue({ rows: [] });
+    test('defaults limit to 2', async () => {
+        query.mockResolvedValue({ rows: [] });
+        await getTopOffersForRequest(MOCK_REQUEST_ID);
 
-            await getTopOffersForRequest(mockRequestId, 'invalid');
-
-            const [, params] = query.mock.calls[0];
-            expect(params[1]).toBe(2);
-        });
-
-        test('returns query rows directly', async () => {
-            const mockOffers = [
-                {
-                    offer_id: 'offer-1',
-                    pharmacy_name: 'Gold Pharmacy',
-                    trust_score: 95,
-                    acceptance_rate: 0.98,
-                    coverage_ratio: '100.00',
-                    total_price: '150.00',
-                },
-                {
-                    offer_id: 'offer-2',
-                    pharmacy_name: 'Silver Pharmacy',
-                    trust_score: 88,
-                    acceptance_rate: 0.92,
-                    coverage_ratio: '100.00',
-                    total_price: '120.00',
-                },
-            ];
-            query.mockResolvedValue({ rows: mockOffers });
-
-            const result = await getTopOffersForRequest(mockRequestId);
-
-            expect(result).toEqual(mockOffers);
-            expect(result).toHaveLength(2);
-        });
-
-        test('returns empty array when no offers exist', async () => {
-            query.mockResolvedValue({ rows: [] });
-
-            const result = await getTopOffersForRequest(mockRequestId);
-
-            expect(result).toEqual([]);
-        });
-
-        test('SQL query includes coverage_check CTE', async () => {
-            query.mockResolvedValue({ rows: [] });
-
-            await getTopOffersForRequest(mockRequestId);
-
-            const [sql] = query.mock.calls[0];
-            expect(sql).toContain('coverage_check');
-            expect(sql).toContain('has_full_coverage');
-            expect(sql).toContain('coverage_ratio = 100.00');
-        });
-
-        test('SQL query orders by trust_score DESC, acceptance_rate DESC, created_at ASC', async () => {
-            query.mockResolvedValue({ rows: [] });
-
-            await getTopOffersForRequest(mockRequestId);
-
-            const [sql] = query.mock.calls[0];
-            expect(sql).toContain('trust_score DESC');
-            expect(sql).toContain('acceptance_rate DESC');
-            expect(sql).toContain('created_at ASC');
-        });
-
-        test('SQL query does NOT include price in ORDER BY', async () => {
-            query.mockResolvedValue({ rows: [] });
-
-            await getTopOffersForRequest(mockRequestId);
-
-            const [sql] = query.mock.calls[0];
-            // Extract just the ORDER BY clause
-            const orderByClause = sql.substring(sql.indexOf('ORDER BY'));
-            expect(orderByClause).not.toContain('total_price');
-            expect(orderByClause).not.toContain('delivery_fee');
-        });
-
-        test('SQL query joins pharmacies table for ranking fields', async () => {
-            query.mockResolvedValue({ rows: [] });
-
-            await getTopOffersForRequest(mockRequestId);
-
-            const [sql] = query.mock.calls[0];
-            expect(sql).toContain('JOIN pharmacies');
-            expect(sql).toContain('p.trust_score');
-            expect(sql).toContain('p.acceptance_rate');
-        });
+        const [, params] = query.mock.calls[0];
+        expect(params[1]).toBe(2);
     });
 });

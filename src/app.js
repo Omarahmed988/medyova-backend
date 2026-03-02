@@ -6,6 +6,8 @@ const morgan = require('morgan');
 const cors = require('cors');
 
 const healthRouter = require('./routes/health');
+const offersRouter = require('./routes/offers');
+const requireDb = require('./middlewares/requireDb');
 const notFound = require('./middlewares/notFound');
 const errorHandler = require('./middlewares/errorHandler');
 
@@ -26,6 +28,7 @@ app.use(express.urlencoded({ extended: false }));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use('/health', healthRouter);
+app.use('/requests', requireDb, offersRouter);
 
 // ─── 404 Catch-All (after all routes) ────────────────────────────────────────
 app.use(notFound);

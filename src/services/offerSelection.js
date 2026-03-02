@@ -1,15 +1,16 @@
 'use strict';
 
 /**
- * Offer Selection Service — Phase 5
+ * Offer Selection Service — Phase 5B
  *
- * Implements the Marketplace Exposure Policy (Spec v4 §8):
+ * Implements the Marketplace Ranking Policy (Governance Spec v2 §4):
  *   - Two-Level Ranking: coverage classification → composite score
  *   - Default visible offers: 2, maximum: 3
- *   - Price is NOT a ranking factor
+ *   - Price is NOT a ranking factor (§4.3 — permanently excluded)
  *
- * This is API-side logic only. The worker stores ALL offers;
- * this service filters what the client sees.
+ * This service is PURE ranking/filtering logic.
+ * It does NOT enforce visibility gates — that is the route handler's job (§6.2).
+ * It does NOT modify any state.
  */
 
 const { query } = require('../config/db');
@@ -23,12 +24,12 @@ const { query } = require('../config/db');
  *   Otherwise, all offers are considered.
  *
  * Level 2 — Composite Score (within coverage level):
- *   1. trust_score DESC (primary)
- *   2. acceptance_rate DESC (secondary)
- *   3. created_at ASC (tertiary — earlier response wins, proxy for response speed)
+ *   1. trust_score DESC        (primary — trust incentivizes quality)
+ *   2. acceptance_rate DESC    (secondary — reliability / commitment)
+ *   3. response_rate DESC      (tertiary — responsiveness / consistency)
+ *   4. created_at ASC          (tiebreaker — earliest response wins)
  *
  * Price is visible to the client but NEVER influences ranking.
- * This prevents a race to the bottom and maintains pharmacy trust incentives.
  *
  * @param {string} requestId - UUID of the request
  * @param {number} [limit=2] - Number of offers to return (max 3)
@@ -63,6 +64,7 @@ async function getTopOffersForRequest(requestId, limit = 2) {
             p.name AS pharmacy_name,
             p.trust_score,
             p.acceptance_rate,
+            p.response_rate,
             p.zone_id AS pharmacy_zone_id,
             p.tier_id AS pharmacy_tier_id
         FROM offers o
@@ -75,10 +77,11 @@ async function getTopOffersForRequest(requestId, limit = 2) {
               OR
               (cc.has_full_coverage = false)
           )
-        -- Level 2: Composite score ordering
+        -- Level 2: Composite score ordering (Governance Spec v2 §4.1)
         ORDER BY
             p.trust_score DESC,
             p.acceptance_rate DESC,
+            p.response_rate DESC,
             o.created_at ASC
         LIMIT $2
     `, [requestId, safeLimit]);
