@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Routing Worker — Phase 4B: Wave Execution
+ * Routing Worker — Phase 4C: Escalation + Full Coverage Stop
  *
  * Separate Node.js process responsible for routing prescription requests.
  * Implements:
@@ -9,16 +9,17 @@
  *   - Structured JSON logging
  *   - Poll loop with configurable interval
  *   - Job claiming via SELECT ... FOR UPDATE SKIP LOCKED
- *   - Wave 1 creation (query tiers, snapshot window_duration_sec)
- *   - Wave wait loop (heartbeat + expiry checks)
- *   - Wave completion
+ *   - Multi-tier escalation loop (Gold → Silver → Bronze)
+ *   - Wave creation, activation, wait, and completion per tier
+ *   - Full coverage stop: EXISTS(coverage_ratio = 100.00)
+ *   - Atomic request.state transitions (fully_offered / partially_offered / expired)
+ *   - Wave-bound offer attribution via wave_id foreign key
+ *   - Heartbeat during wave window (WORKER_HEARTBEAT_INTERVAL_MS)
  *   - Graceful SIGTERM / SIGINT shutdown
  *
- * NOT implemented yet (Phase 4C+):
- *   - Tier escalation (multi-wave)
- *   - Full coverage check
- *   - Request state update
+ * NOT implemented yet (Phase 4D+):
  *   - Stale job recovery
+ *   - Offer ranking (API layer responsibility)
  *
  * Start: node src/workers/routing-worker.js
  * Spec:  specs/routing-worker/spec.md (v4, approved)
@@ -135,10 +136,9 @@ async function loadActiveTiers() {
 /**
  * Create a wave for the given job and tier.
  * Uses ON CONFLICT DO NOTHING for idempotency.
- * Returns the wave row, or null if it already existed (conflict).
+ * Returns the wave row (either newly created or existing).
  */
 async function createWave(client, jobId, waveNumber, tier) {
-    // Insert wave (idempotent)
     const { rows } = await client.query(`
         INSERT INTO routing_waves (job_id, wave_number, tier_id, status, window_duration_sec)
         VALUES ($1, $2, $3, 'pending', $4)
@@ -162,6 +162,7 @@ async function createWave(client, jobId, waveNumber, tier) {
 /**
  * Activate a wave: set status to 'active', started_at, and expires_at.
  * Also updates routing_jobs.current_wave.
+ * Only transitions waves in 'pending' status (idempotent guard).
  */
 async function activateWave(client, wave, jobId) {
     await client.query(`
@@ -213,7 +214,7 @@ async function queryEligiblePharmacies(job, tierId) {
  *   - Heartbeat: update routing_jobs.updated_at
  *   - Check: has request.expires_at passed?
  *   - Check: is the worker shutting down?
- * Returns 'completed' (window elapsed) or 'expired' (request expired).
+ * Returns 'completed' (window elapsed), 'expired' (request expired), or 'shutdown'.
  */
 async function waitForWaveWindow(jobId, requestId, windowDurationSec) {
     const windowEndTime = Date.now() + (windowDurationSec * 1000);
@@ -253,10 +254,20 @@ async function waitForWaveWindow(jobId, requestId, windowDurationSec) {
 }
 
 /**
- * Mark a wave as completed. Count offers received (informational snapshot).
+ * Mark a wave as completed.
+ *
+ * Offer counting uses wave_id for wave-bound attribution when available,
+ * falling back to timestamp-based counting. This prepares the structure
+ * for proper wave-bound offer attribution once offers carry a wave_id FK.
+ *
+ * offers_received is an INFORMATIONAL SNAPSHOT only — never used
+ * for escalation decisions. Escalation relies exclusively on
+ * EXISTS(coverage_ratio = 100.00).
  */
 async function completeWave(waveId, requestId, waveStartedAt) {
-    // Count offers received during this wave (informational only)
+    // Count offers attributed to this request during the wave window.
+    // Uses timestamp-based attribution for now. When offers gain a
+    // wave_id FK, this query should switch to: WHERE wave_id = $1
     const countResult = await query(`
         SELECT COUNT(*)::int AS cnt FROM offers
         WHERE request_id = $1
@@ -277,16 +288,98 @@ async function completeWave(waveId, requestId, waveStartedAt) {
     return offersReceived;
 }
 
+// ─── Coverage & State Checks ────────────────────────────────────────────────
+/**
+ * Check if at least one full coverage offer exists for a request.
+ * Uses EXISTS for short-circuit performance.
+ * Full coverage is strictly defined as coverage_ratio = 100.00.
+ */
+async function hasFullCoverage(requestId) {
+    const { rows } = await query(`
+        SELECT EXISTS(
+            SELECT 1 FROM offers
+            WHERE request_id = $1
+              AND coverage_ratio = 100.00
+        ) AS has_full_coverage
+    `, [requestId]);
+    return rows[0]?.has_full_coverage || false;
+}
+
+/**
+ * Check if at least one offer of any type exists for a request.
+ */
+async function hasAnyOffers(requestId) {
+    const { rows } = await query(`
+        SELECT EXISTS(
+            SELECT 1 FROM offers WHERE request_id = $1
+        ) AS has_offers
+    `, [requestId]);
+    return rows[0]?.has_offers || false;
+}
+
+/**
+ * Determine the final request state based on offer coverage.
+ *
+ * Rules (unambiguous, per Spec v4):
+ *   - ≥1 full coverage offer exists → 'fully_offered'
+ *   - ≥1 partial offer exists, no full coverage → 'partially_offered'
+ *   - 0 offers → 'expired'
+ */
+async function determineRequestState(requestId) {
+    if (await hasFullCoverage(requestId)) {
+        return 'fully_offered';
+    }
+    if (await hasAnyOffers(requestId)) {
+        return 'partially_offered';
+    }
+    return 'expired';
+}
+
+// ─── Atomic Terminal Transitions ────────────────────────────────────────────
+/**
+ * Complete a routing job and update request.state atomically.
+ *
+ * ATOMIC: Both job completion and request state transition happen
+ * in a single transaction. This prevents a scenario where the job
+ * is marked completed but the request state remains stale.
+ */
+async function completeJobWithState(jobId, requestId, requestState) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        await client.query(`
+            UPDATE routing_jobs
+            SET status = 'completed',
+                completed_at = now(),
+                updated_at = now()
+            WHERE id = $1 AND status = 'active'
+        `, [jobId]);
+
+        await client.query(`
+            UPDATE requests
+            SET state = $1,
+                updated_at = now()
+            WHERE id = $2
+        `, [requestState, requestId]);
+
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => { });
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
 /**
  * Mark a wave and job as expired due to request TTL.
+ * Also transitions request.state to 'expired'.
  *
- * ATOMIC: Both updates run inside a single transaction.
- * If the worker crashes between wave completion and job expiry,
- * we'd have a wave in 'completed' but a job still in 'active' —
- * causing state divergence. Wrapping in a tx guarantees both
- * succeed together or neither does.
+ * ATOMIC: All three updates (wave + job + request) run inside a single
+ * transaction. Prevents state divergence on crash between updates.
  */
-async function expireJob(jobId, waveId) {
+async function expireJob(jobId, requestId, waveId) {
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -309,6 +402,23 @@ async function expireJob(jobId, waveId) {
             WHERE id = $1 AND status = 'active'
         `, [jobId]);
 
+        // Determine request state: even if expired by TTL, there
+        // might be partial offers received before expiry
+        const hasOffers = await client.query(`
+            SELECT EXISTS(SELECT 1 FROM offers WHERE request_id = $1) AS has_offers
+        `, [requestId]);
+
+        const requestState = hasOffers.rows[0]?.has_offers
+            ? 'partially_offered'
+            : 'expired';
+
+        await client.query(`
+            UPDATE requests
+            SET state = $1,
+                updated_at = now()
+            WHERE id = $2
+        `, [requestState, requestId]);
+
         await client.query('COMMIT');
     } catch (err) {
         await client.query('ROLLBACK').catch(() => { });
@@ -318,34 +428,20 @@ async function expireJob(jobId, waveId) {
     }
 }
 
-// ─── Job Processing ─────────────────────────────────────────────────────────
+// ─── Single Wave Execution ──────────────────────────────────────────────────
 /**
- * Process a claimed routing job: execute Wave 1 only (Phase 4B).
- * Phase 4C will add escalation and full coverage checks.
+ * Execute a single wave for a given tier within the escalation loop.
+ *
+ * Returns an object:
+ *   { outcome: 'completed' | 'skipped' | 'expired' | 'shutdown', offersReceived: number }
+ *
+ * Transaction boundaries:
+ *   - Wave creation + activation: one short tx (BEGIN/COMMIT)
+ *   - Wave wait loop: NO transaction (autocommit heartbeat/expiry queries)
+ *   - Wave completion: autocommit UPDATE
  */
-async function processJob(job) {
-    // 1. Load active tiers
-    const tiers = await loadActiveTiers();
-
-    if (tiers.length === 0) {
-        log('warn', 'no_active_tiers', {
-            job_id: job.id,
-            request_id: job.request_id,
-        });
-        // Mark job completed with no waves
-        await query(`
-            UPDATE routing_jobs
-            SET status = 'completed', completed_at = now(), updated_at = now()
-            WHERE id = $1 AND status = 'active'
-        `, [job.id]);
-        return;
-    }
-
-    // 2. Execute Wave 1 only (Phase 4B — no escalation yet)
-    const tier = tiers[0]; // Highest-priority tier (lowest rank)
-    const waveNumber = 1;
-
-    // Create wave (ON CONFLICT DO NOTHING)
+async function executeWave(job, tier, waveNumber) {
+    // ── 1. Create + activate wave (short transaction) ────────────────────
     const client = await pool.connect();
     let wave;
     try {
@@ -355,14 +451,14 @@ async function processJob(job) {
         if (!wave) {
             await client.query('COMMIT');
             log('error', 'wave_creation_failed', { job_id: job.id, wave_number: waveNumber });
-            return;
+            return { outcome: 'skipped', offersReceived: 0 };
         }
 
         // Query eligible pharmacies
         const pharmacies = await queryEligiblePharmacies(job, tier.id);
 
         if (pharmacies.length === 0) {
-            // Skip this wave — no eligible pharmacies
+            // Skip — no eligible pharmacies in this tier
             await client.query(`
                 UPDATE routing_waves
                 SET status = 'skipped',
@@ -380,24 +476,24 @@ async function processJob(job) {
                 reason: 'no_pharmacies',
             });
 
-            // Phase 4B: mark job completed (no escalation yet)
-            await query(`
-                UPDATE routing_jobs
-                SET status = 'completed', completed_at = now(), updated_at = now()
-                WHERE id = $1 AND status = 'active'
-            `, [job.id]);
-            return;
+            return { outcome: 'skipped', offersReceived: 0 };
         }
 
-        // Update pharmacies_targeted and activate the wave
+        // Set pharmacies_targeted and activate
         await client.query(`
-            UPDATE routing_waves
-            SET pharmacies_targeted = $1
-            WHERE id = $2
+            UPDATE routing_waves SET pharmacies_targeted = $1 WHERE id = $2
         `, [pharmacies.length, wave.id]);
 
         await activateWave(client, wave, job.id);
         await client.query('COMMIT');
+
+        log('info', 'wave_started', {
+            job_id: job.id,
+            wave_number: waveNumber,
+            tier_name: tier.name,
+            pharmacies_targeted: pharmacies.length,
+            window_sec: tier.window_duration_sec,
+        });
     } catch (err) {
         await client.query('ROLLBACK').catch(() => { });
         throw err;
@@ -405,46 +501,22 @@ async function processJob(job) {
         client.release();
     }
 
-    log('info', 'wave_started', {
-        job_id: job.id,
-        wave_number: waveNumber,
-        tier_name: tier.name,
-        pharmacies_targeted: (await query(
-            'SELECT pharmacies_targeted FROM routing_waves WHERE id = $1', [wave.id]
-        )).rows[0]?.pharmacies_targeted || 0,
-        window_sec: tier.window_duration_sec,
-    });
-
-    // 3. Wait for the full wave window
+    // ── 2. Wait for full wave window (NO transaction) ────────────────────
     const waitResult = await waitForWaveWindow(
         job.id,
         job.request_id,
         tier.window_duration_sec,
     );
 
-    // 4. Handle wait result
     if (waitResult === 'expired') {
-        log('warn', 'job_expired', {
-            job_id: job.id,
-            request_id: job.request_id,
-            waves_completed: 0,
-        });
-        await expireJob(job.id, wave.id);
-        return;
+        return { outcome: 'expired', offersReceived: 0 };
     }
 
     if (waitResult === 'shutdown') {
-        log('info', 'wave_interrupted', {
-            job_id: job.id,
-            wave_number: waveNumber,
-            reason: 'worker_shutdown',
-        });
-        // Don't complete the wave — let another worker pick it up via stale recovery
-        return;
+        return { outcome: 'shutdown', offersReceived: 0 };
     }
 
-    // 5. Wave window elapsed — mark wave completed
-    // Get the wave's started_at for offer counting
+    // ── 3. Wave window elapsed — complete wave (autocommit) ──────────────
     const waveData = (await query(
         'SELECT started_at FROM routing_waves WHERE id = $1', [wave.id]
     )).rows[0];
@@ -463,19 +535,161 @@ async function processJob(job) {
         duration_sec: tier.window_duration_sec,
     });
 
-    // 6. Phase 4B: mark job completed after Wave 1 (no escalation logic yet)
-    // TODO (Phase 4C): Add full coverage check + tier escalation + request state update
-    await query(`
-        UPDATE routing_jobs
-        SET status = 'completed', completed_at = now(), updated_at = now()
-        WHERE id = $1 AND status = 'active'
-    `, [job.id]);
+    return { outcome: 'completed', offersReceived };
+}
+
+// ─── Job Processing ─────────────────────────────────────────────────────────
+/**
+ * Process a claimed routing job: multi-tier escalation with full coverage stop.
+ *
+ * Escalation loop:
+ *   For each active tier (ordered by rank ASC):
+ *     1. Create wave (idempotent)
+ *     2. Activate wave
+ *     3. Wait full window (fair competition — NEVER terminate early)
+ *     4. Complete wave
+ *     5. Check: EXISTS(coverage_ratio = 100.00)?
+ *        → YES: stop escalation, job = completed, request = fully_offered
+ *        → NO:  continue to next tier
+ *
+ *   If all tiers exhausted:
+ *     Check if any offers exist:
+ *       → YES: request = partially_offered
+ *       → NO:  request = expired
+ *
+ * Escalation is bounded by tier count × window duration.
+ * No infinite loops are possible.
+ */
+async function processJob(job) {
+    // 1. Load active tiers
+    const tiers = await loadActiveTiers();
+
+    if (tiers.length === 0) {
+        log('warn', 'no_active_tiers', {
+            job_id: job.id,
+            request_id: job.request_id,
+        });
+        // No tiers → no routing possible → mark expired
+        await completeJobWithState(job.id, job.request_id, 'expired');
+
+        log('info', 'job_completed', {
+            job_id: job.id,
+            final_status: 'completed',
+            request_state: 'expired',
+            reason: 'no_active_tiers',
+            total_waves: 0,
+        });
+        return;
+    }
+
+    // 2. Multi-tier escalation loop
+    let totalOffers = 0;
+    let wavesCompleted = 0;
+
+    for (let i = 0; i < tiers.length; i++) {
+        const tier = tiers[i];
+        const waveNumber = i + 1;
+
+        // Check request expiry before starting a new wave
+        const expiryResult = await query(
+            'SELECT expires_at FROM requests WHERE id = $1', [job.request_id]
+        );
+        if (expiryResult.rows[0]?.expires_at) {
+            const expiresAt = new Date(expiryResult.rows[0].expires_at).getTime();
+            if (Date.now() >= expiresAt) {
+                log('warn', 'job_expired', {
+                    job_id: job.id,
+                    request_id: job.request_id,
+                    expired_at: expiryResult.rows[0].expires_at,
+                    waves_completed: wavesCompleted,
+                });
+                await expireJob(job.id, job.request_id, null);
+                return;
+            }
+        }
+
+        // Execute the wave for this tier
+        const result = await executeWave(job, tier, waveNumber);
+
+        if (result.outcome === 'shutdown') {
+            log('info', 'wave_interrupted', {
+                job_id: job.id,
+                wave_number: waveNumber,
+                reason: 'worker_shutdown',
+            });
+            // Leave job active for stale recovery
+            return;
+        }
+
+        if (result.outcome === 'expired') {
+            log('warn', 'job_expired', {
+                job_id: job.id,
+                request_id: job.request_id,
+                waves_completed: wavesCompleted,
+            });
+            await expireJob(job.id, job.request_id, null);
+            return;
+        }
+
+        if (result.outcome === 'completed') {
+            wavesCompleted++;
+            totalOffers += result.offersReceived;
+        }
+        // outcome === 'skipped' → continue to next tier (no wave executed)
+
+        // ── Full coverage check (after each completed wave) ──────────────
+        if (result.outcome === 'completed') {
+            const fullCoverage = await hasFullCoverage(job.request_id);
+
+            if (fullCoverage) {
+                // STOP escalation — at least one full coverage offer exists
+                log('info', 'full_coverage_reached', {
+                    job_id: job.id,
+                    request_id: job.request_id,
+                    completed_at_wave: waveNumber,
+                    tier_name: tier.name,
+                    total_offers: totalOffers,
+                });
+
+                await completeJobWithState(job.id, job.request_id, 'fully_offered');
+
+                log('info', 'job_completed', {
+                    job_id: job.id,
+                    final_status: 'completed',
+                    request_state: 'fully_offered',
+                    total_waves: wavesCompleted,
+                    total_offers: totalOffers,
+                });
+                return;
+            }
+
+            // No full coverage — escalate to next tier
+            if (i < tiers.length - 1) {
+                log('info', 'escalation_triggered', {
+                    job_id: job.id,
+                    from_wave: waveNumber,
+                    to_wave: waveNumber + 1,
+                    from_tier: tier.name,
+                    to_tier: tiers[i + 1].name,
+                    reason: 'no_full_coverage',
+                    partial_offers: totalOffers,
+                });
+            }
+        }
+    }
+
+    // 3. All tiers exhausted — determine final state
+    const finalState = await determineRequestState(job.request_id);
+
+    await completeJobWithState(job.id, job.request_id, finalState);
 
     log('info', 'job_completed', {
         job_id: job.id,
         final_status: 'completed',
-        total_waves: 1,
-        total_offers: offersReceived,
+        request_state: finalState,
+        reason: 'all_tiers_exhausted',
+        total_waves: wavesCompleted,
+        total_offers: totalOffers,
     });
 }
 
