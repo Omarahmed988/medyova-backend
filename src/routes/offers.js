@@ -1,33 +1,28 @@
 'use strict';
 
 /**
- * Offers Route — GET /requests/:id/offers
+ * Offers Route — Phase 5B + Phase 6
  *
- * Returns top-ranked offers for a given request, subject to the
- * Visibility Gate (Governance Spec v2 §2.2).
+ * GET  /requests/:id/offers                          — Visibility-gated offer selection
+ * POST /requests/:requestId/offers/:offerId/accept   — Offer acceptance
  *
- * Gate Rule:
+ * Visibility Gate (Governance Spec v2 §2.2):
  *   selection_allowed = (
  *       request.state IN ('fully_offered', 'partially_offered')
  *       AND routing_jobs.status IN ('completed', 'expired')
  *   )
  *
- * If gate fails → HTTP 200 with [] (empty array).
- * If gate passes → delegates to offerSelection service for ranking.
- *
- * Defensive recovery:
- *   If request.state = 'expired' but full coverage offers exist,
- *   log invariant_violation_I1 and still serve the offers (§3.3).
- *
- * Separation of Concerns (§6.2):
- *   This route handler is the SOLE enforcer of the visibility gate.
- *   The service layer is pure ranking/filtering — no gate logic.
+ * Acceptance (Acceptance Spec v2 §2):
+ *   Requires authentication + ownership.
+ *   Uses 7-step atomic transaction with request→offer lock order.
+ *   Returns structured error codes on 409.
  */
 
 const express = require('express');
 const router = express.Router();
 const { query } = require('../config/db');
 const { getTopOffersForRequest } = require('../services/offerSelection');
+const { acceptOffer, ERROR_CODES } = require('../services/offerAcceptance');
 
 /**
  * GET /requests/:id/offers
@@ -114,6 +109,94 @@ router.get('/:id/offers', async (req, res, next) => {
         const offers = await getTopOffersForRequest(requestId, limit);
 
         return res.status(200).json({ offers });
+    } catch (err) {
+        next(err);
+    }
+});
+
+/**
+ * POST /requests/:requestId/offers/:offerId/accept
+ *
+ * Accepts an offer for a request (Acceptance Spec v2 §2).
+ *
+ * Requires:
+ *   - Authentication (req.user must exist)
+ *   - Ownership (request.user_id must match req.user.id)
+ *
+ * Response:
+ *   200 — { accepted: true, offer_id, request_id, request_state: 'accepted' }
+ *   401 — Unauthorized (no auth)
+ *   403 — Forbidden (user doesn't own request)
+ *   404 — Request or offer not found
+ *   409 — Conflict with structured error_code
+ */
+router.post('/:requestId/offers/:offerId/accept', async (req, res, next) => {
+    try {
+        const { requestId, offerId } = req.params;
+
+        // ── Authentication check ─────────────────────────────────────────
+        if (!req.user || !req.user.id) {
+            return res.status(401).json({
+                error: 'Unauthorized',
+                message: 'Authentication required to accept offers.',
+                statusCode: 401,
+            });
+        }
+
+        // ── Ownership check ──────────────────────────────────────────────
+        const ownerCheck = await query(
+            'SELECT user_id FROM requests WHERE id = $1',
+            [requestId]
+        );
+
+        if (ownerCheck.rows.length === 0) {
+            return res.status(404).json({
+                error: 'Not Found',
+                error_code: ERROR_CODES.REQUEST_NOT_FOUND,
+                message: 'Request not found.',
+                statusCode: 404,
+            });
+        }
+
+        const requestOwnerId = ownerCheck.rows[0].user_id;
+        if (requestOwnerId !== req.user.id) {
+            return res.status(403).json({
+                error: 'Forbidden',
+                message: 'You do not own this request.',
+                statusCode: 403,
+            });
+        }
+
+        // ── Delegate to acceptance service ───────────────────────────────
+        const result = await acceptOffer(requestId, offerId);
+
+        if (result.success) {
+            return res.status(200).json({
+                accepted: true,
+                offer_id: offerId,
+                request_id: requestId,
+                request_state: 'accepted',
+            });
+        }
+
+        // Map error codes to HTTP status codes
+        const statusMap = {
+            [ERROR_CODES.REQUEST_NOT_FOUND]: 404,
+            [ERROR_CODES.OFFER_NOT_FOUND]: 404,
+            [ERROR_CODES.REQUEST_NOT_ACCEPTING]: 409,
+            [ERROR_CODES.OFFER_ALREADY_ACCEPTED]: 409,
+            [ERROR_CODES.OFFER_ALREADY_REJECTED]: 409,
+            [ERROR_CODES.OFFER_EXPIRED]: 409,
+        };
+
+        const httpStatus = statusMap[result.error_code] || 409;
+
+        return res.status(httpStatus).json({
+            error: httpStatus === 404 ? 'Not Found' : 'Conflict',
+            error_code: result.error_code,
+            message: result.message,
+            statusCode: httpStatus,
+        });
     } catch (err) {
         next(err);
     }
