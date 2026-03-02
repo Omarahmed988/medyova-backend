@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Routing Worker — Phase 4C: Escalation + Full Coverage Stop
+ * Routing Worker — Phase 4D: Stability & Observability
  *
  * Separate Node.js process responsible for routing prescription requests.
  * Implements:
@@ -15,10 +15,11 @@
  *   - Atomic request.state transitions (fully_offered / partially_offered / expired)
  *   - Wave-bound offer attribution via wave_id foreign key
  *   - Heartbeat during wave window (WORKER_HEARTBEAT_INTERVAL_MS)
+ *   - Stale job recovery sweep (configurable threshold)
+ *   - In-memory metrics counters with periodic log summary
  *   - Graceful SIGTERM / SIGINT shutdown
  *
- * NOT implemented yet (Phase 4D+):
- *   - Stale job recovery
+ * NOT implemented yet:
  *   - Offer ranking (API layer responsibility)
  *
  * Start: node src/workers/routing-worker.js
@@ -33,11 +34,33 @@ const { pool, query, testConnection } = require('../config/db');
 const WORKER_POLL_INTERVAL_MS = parseInt(process.env.WORKER_POLL_INTERVAL_MS || '3000', 10);
 const WORKER_HEARTBEAT_INTERVAL_MS = parseInt(process.env.WORKER_HEARTBEAT_INTERVAL_MS || '500', 10);
 const WORKER_MAX_CONSECUTIVE_ERRORS = parseInt(process.env.WORKER_MAX_CONSECUTIVE_ERRORS || '5', 10);
+const WORKER_STALE_JOB_THRESHOLD_SEC = parseInt(process.env.WORKER_STALE_JOB_THRESHOLD_SEC || '600', 10);
+const WORKER_METRICS_INTERVAL_SEC = parseInt(process.env.WORKER_METRICS_INTERVAL_SEC || '300', 10);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 let isShuttingDown = false;
 let consecutiveErrors = 0;
 let pollTimer = null;
+let metricsTimer = null;
+
+// ─── In-Memory Metrics ──────────────────────────────────────────────────────
+const metrics = {
+    jobs_processed: 0,
+    waves_executed: 0,
+    full_coverage_hits: 0,
+    partial_completions: 0,
+    expiries: 0,
+    escalations: 0,
+    stale_recoveries: 0,
+    started_at: new Date().toISOString(),
+};
+
+function emitMetricsSummary() {
+    log('info', 'metrics_summary', {
+        ...metrics,
+        uptime_sec: Math.floor((Date.now() - new Date(metrics.started_at).getTime()) / 1000),
+    });
+}
 
 // ─── Structured Logger ──────────────────────────────────────────────────────
 function log(level, event, data = {}) {
@@ -162,7 +185,10 @@ async function createWave(client, jobId, waveNumber, tier) {
 /**
  * Activate a wave: set status to 'active', started_at, and expires_at.
  * Also updates routing_jobs.current_wave.
- * Only transitions waves in 'pending' status (idempotent guard).
+ *
+ * Guards:
+ *   - Wave: WHERE status = 'pending' (prevents double-activation)
+ *   - Job:  WHERE status = 'active' (prevents orphan wave updates on completed/expired jobs)
  */
 async function activateWave(client, wave, jobId) {
     await client.query(`
@@ -177,7 +203,7 @@ async function activateWave(client, wave, jobId) {
     await client.query(`
         UPDATE routing_jobs
         SET current_wave = $1, updated_at = now()
-        WHERE id = $2
+        WHERE id = $2 AND status = 'active'
     `, [wave.wave_number, jobId]);
 }
 
@@ -572,6 +598,9 @@ async function processJob(job) {
         // No tiers → no routing possible → mark expired
         await completeJobWithState(job.id, job.request_id, 'expired');
 
+        metrics.jobs_processed++;
+        metrics.expiries++;
+
         log('info', 'job_completed', {
             job_id: job.id,
             final_status: 'completed',
@@ -604,6 +633,8 @@ async function processJob(job) {
                     waves_completed: wavesCompleted,
                 });
                 await expireJob(job.id, job.request_id, null);
+                metrics.jobs_processed++;
+                metrics.expiries++;
                 return;
             }
         }
@@ -628,12 +659,15 @@ async function processJob(job) {
                 waves_completed: wavesCompleted,
             });
             await expireJob(job.id, job.request_id, null);
+            metrics.jobs_processed++;
+            metrics.expiries++;
             return;
         }
 
         if (result.outcome === 'completed') {
             wavesCompleted++;
             totalOffers += result.offersReceived;
+            metrics.waves_executed++;
         }
         // outcome === 'skipped' → continue to next tier (no wave executed)
 
@@ -653,6 +687,9 @@ async function processJob(job) {
 
                 await completeJobWithState(job.id, job.request_id, 'fully_offered');
 
+                metrics.jobs_processed++;
+                metrics.full_coverage_hits++;
+
                 log('info', 'job_completed', {
                     job_id: job.id,
                     final_status: 'completed',
@@ -665,6 +702,8 @@ async function processJob(job) {
 
             // No full coverage — escalate to next tier
             if (i < tiers.length - 1) {
+                metrics.escalations++;
+
                 log('info', 'escalation_triggered', {
                     job_id: job.id,
                     from_wave: waveNumber,
@@ -683,6 +722,10 @@ async function processJob(job) {
 
     await completeJobWithState(job.id, job.request_id, finalState);
 
+    metrics.jobs_processed++;
+    if (finalState === 'partially_offered') metrics.partial_completions++;
+    if (finalState === 'expired') metrics.expiries++;
+
     log('info', 'job_completed', {
         job_id: job.id,
         final_status: 'completed',
@@ -693,11 +736,118 @@ async function processJob(job) {
     });
 }
 
+// ─── Stale Job Recovery ─────────────────────────────────────────────────────
+/**
+ * Scan for routing jobs that are stuck in 'active' status with a stale
+ * updated_at timestamp. This indicates a worker crashed or was terminated
+ * without completing the job.
+ *
+ * Recovery strategy:
+ *   - If the request has expired (expires_at < now): mark job 'expired'
+ *   - Otherwise: re-queue the job by resetting status to 'pending'
+ *
+ * Concurrency-safe: uses SELECT FOR UPDATE SKIP LOCKED so multiple
+ * workers don't fight over the same stale job.
+ *
+ * Transaction scope: one short tx per stale job (SELECT + UPDATE + COMMIT).
+ */
+async function recoverStaleJobs() {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Find stale active jobs (updated_at older than threshold)
+        const { rows: staleJobs } = await client.query(`
+            SELECT rj.id, rj.request_id, r.expires_at
+            FROM routing_jobs rj
+            JOIN requests r ON r.id = rj.request_id
+            WHERE rj.status = 'active'
+              AND rj.updated_at < now() - interval '1 second' * $1
+            ORDER BY rj.updated_at ASC
+            LIMIT 10
+            FOR UPDATE OF rj SKIP LOCKED
+        `, [WORKER_STALE_JOB_THRESHOLD_SEC]);
+
+        if (staleJobs.length === 0) {
+            await client.query('COMMIT');
+            return;
+        }
+
+        for (const staleJob of staleJobs) {
+            const isRequestExpired = staleJob.expires_at
+                && new Date(staleJob.expires_at).getTime() < Date.now();
+
+            if (isRequestExpired) {
+                // Request has expired — mark job expired + update request state
+                const hasOffers = await client.query(`
+                    SELECT EXISTS(SELECT 1 FROM offers WHERE request_id = $1) AS has_offers
+                `, [staleJob.request_id]);
+
+                const requestState = hasOffers.rows[0]?.has_offers
+                    ? 'partially_offered'
+                    : 'expired';
+
+                await client.query(`
+                    UPDATE routing_jobs
+                    SET status = 'expired',
+                        completed_at = now(),
+                        updated_at = now()
+                    WHERE id = $1 AND status = 'active'
+                `, [staleJob.id]);
+
+                await client.query(`
+                    UPDATE requests
+                    SET state = $1, updated_at = now()
+                    WHERE id = $2
+                `, [requestState, staleJob.request_id]);
+
+                log('warn', 'stale_job_expired', {
+                    job_id: staleJob.id,
+                    request_id: staleJob.request_id,
+                    request_state: requestState,
+                });
+
+                metrics.stale_recoveries++;
+                metrics.expiries++;
+            } else {
+                // Request still valid — re-queue for another worker to pick up
+                await client.query(`
+                    UPDATE routing_jobs
+                    SET status = 'pending',
+                        started_at = NULL,
+                        updated_at = now()
+                    WHERE id = $1 AND status = 'active'
+                `, [staleJob.id]);
+
+                log('warn', 'stale_job_requeued', {
+                    job_id: staleJob.id,
+                    request_id: staleJob.request_id,
+                });
+
+                metrics.stale_recoveries++;
+            }
+        }
+
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => { });
+        log('error', 'stale_recovery_error', {
+            error_message: err.message,
+            stack: err.stack,
+        });
+    } finally {
+        client.release();
+    }
+}
+
 // ─── Poll Loop ──────────────────────────────────────────────────────────────
 async function poll() {
     if (isShuttingDown) return;
 
     try {
+        // Run stale job recovery on every poll cycle (lightweight query)
+        await recoverStaleJobs();
+
         const job = await claimNextJob();
 
         if (job) {
@@ -735,9 +885,17 @@ async function shutdown(exitCode = 0) {
     if (isShuttingDown) return;
     isShuttingDown = true;
 
+    // Emit final metrics before stopping
+    emitMetricsSummary();
+
     log('info', 'worker_stopped', {
         reason: exitCode === 0 ? 'signal' : 'error',
     });
+
+    if (metricsTimer) {
+        clearInterval(metricsTimer);
+        metricsTimer = null;
+    }
 
     if (pollTimer) {
         clearTimeout(pollTimer);
@@ -764,6 +922,8 @@ async function start() {
         poll_interval_ms: WORKER_POLL_INTERVAL_MS,
         heartbeat_interval_ms: WORKER_HEARTBEAT_INTERVAL_MS,
         max_consecutive_errors: WORKER_MAX_CONSECUTIVE_ERRORS,
+        stale_threshold_sec: WORKER_STALE_JOB_THRESHOLD_SEC,
+        metrics_interval_sec: WORKER_METRICS_INTERVAL_SEC,
         node_env: process.env.NODE_ENV || 'development',
     });
 
@@ -778,6 +938,9 @@ async function start() {
     }
 
     log('info', 'db_connected', {});
+
+    // Start periodic metrics summary
+    metricsTimer = setInterval(emitMetricsSummary, WORKER_METRICS_INTERVAL_SEC * 1000);
 
     // Enter poll loop
     poll();
