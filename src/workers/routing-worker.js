@@ -279,25 +279,43 @@ async function completeWave(waveId, requestId, waveStartedAt) {
 
 /**
  * Mark a wave and job as expired due to request TTL.
+ *
+ * ATOMIC: Both updates run inside a single transaction.
+ * If the worker crashes between wave completion and job expiry,
+ * we'd have a wave in 'completed' but a job still in 'active' —
+ * causing state divergence. Wrapping in a tx guarantees both
+ * succeed together or neither does.
  */
 async function expireJob(jobId, waveId) {
-    if (waveId) {
-        await query(`
-            UPDATE routing_waves
-            SET status = 'completed',
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        if (waveId) {
+            await client.query(`
+                UPDATE routing_waves
+                SET status = 'completed',
+                    completed_at = now(),
+                    updated_at = now()
+                WHERE id = $1 AND status = 'active'
+            `, [waveId]);
+        }
+
+        await client.query(`
+            UPDATE routing_jobs
+            SET status = 'expired',
                 completed_at = now(),
                 updated_at = now()
             WHERE id = $1 AND status = 'active'
-        `, [waveId]);
-    }
+        `, [jobId]);
 
-    await query(`
-        UPDATE routing_jobs
-        SET status = 'expired',
-            completed_at = now(),
-            updated_at = now()
-        WHERE id = $1 AND status = 'active'
-    `, [jobId]);
+        await client.query('COMMIT');
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => { });
+        throw err;
+    } finally {
+        client.release();
+    }
 }
 
 // ─── Job Processing ─────────────────────────────────────────────────────────
