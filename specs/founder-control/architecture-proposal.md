@@ -1,21 +1,23 @@
 # Phase 11 — Founder Control & Feature Governance Layer
-# Architecture Proposal v2
+# Architecture Proposal v3
 
-> **Status**: v2 — Design Gate (Corrections Applied, Awaiting Final Approval)
+> **Status**: v3 — Final Safeguards Applied (Awaiting Final Approval)
 > **Level**: CTO Architectural Review
 > **Date**: 2026-03-03
-> **Preceding version**: v1 (submitted 2026-03-03)
+> **Preceding version**: v2 (submitted 2026-03-03)
 
 ---
 
 ## Executive Summary
 
-This v2 proposal incorporates four mandatory architectural refinements requested after the v1 review:
+This v3 proposal incorporates two additional operational safeguards requested after v2 approval:
 
-1. **Deterministic cache invalidation** — PostgreSQL `LISTEN/NOTIFY` replaces TTL-only refresh
-2. **Strict `scope_id` validation** — application-layer enforcement without DB FKs
-3. **Commission = 0% allowed** — with cap, audit, and reversibility guarantee
-4. **Subscription engine OFF model** — evaluated, decision made (Hard Stop, Option A)
+1. **Deterministic cache invalidation** — PostgreSQL `LISTEN/NOTIFY` replaces TTL-only refresh *(v2)*
+2. **Strict `scope_id` validation** — application-layer enforcement without DB FKs *(v2)*
+3. **Commission = 0% allowed** — with cap, audit, and reversibility guarantee *(v2)*
+4. **Subscription engine OFF model** — Hard Stop (Option A) *(v2)*
+5. **Critical Change Confirmation Protocol** — high-impact mutations require `{ confirm: true }` *(v3)*
+6. **Critical Audit Review Endpoint** — `GET /admin/audit/critical` for rapid post-change verification *(v3)*
 
 Core invariants (routing escalation, acceptance transaction, order state machine, JWT secret, atomicity guarantees) remain permanently non-configurable by design.
 
@@ -243,15 +245,15 @@ The `subscription_engine_enabled` feature flag can be set to `false` by a `super
 
 ### F.1 Operational Risk
 
-| Change | Risk | Severity | Guard |
-|--------|------|:---:|-------|
-| Commission → 0% | Revenue elimination | 🟠 High | `super_admin` only, mandatory audit log |
-| Commission → 30% | Pharmacy margin destruction | 🔴 Critical | `max_val = 30.00` hard cap at write |
-| SLA timeout → 60s | Rapid auto-cancel flood | 🟠 High | `min_val = 60` |
-| Disable subscription engine | Chronic patients miss monthly cycle | 🟠 High | Hard Stop (no thundering herd on re-enable) |
-| Disable insurance routing | Insured users hit unfiltered routing | 🟡 Medium | Pharmacy is final eligibility gate |
-| Disable rare routing | Rare requests get zero offers | 🔴 Critical | Fail-closed; request remains open but unserviced |
-| Zone maintenance mode | All new requests rejected in zone | 🔴 Critical | Check metrics before enabling |
+| Change | Risk | Severity | Guard | v3 Safeguard |
+|--------|------|:---:|-------|:---:|
+| Commission → 0% | Revenue elimination | 🟠 High | `super_admin` only, mandatory audit log | ✅ `confirm: true` required |
+| Commission → 30% | Pharmacy margin destruction | 🔴 Critical | `max_val = 30.00` hard cap at write | ✅ `confirm: true` required |
+| SLA timeout → 60s | Rapid auto-cancel flood | 🟠 High | `min_val = 60` | ✅ `confirm: true` required |
+| Disable subscription engine | Chronic patients miss monthly cycle | 🟠 High | Hard Stop (no thundering herd on re-enable) | ✅ `confirm: true` required |
+| Disable insurance routing | Insured users hit unfiltered routing | 🟡 Medium | Pharmacy is final eligibility gate | ✅ `confirm: true` required |
+| Disable rare routing | Rare requests get zero offers | 🔴 Critical | Fail-closed; request remains open but unserviced | ✅ `confirm: true` required |
+| Zone maintenance mode | All new requests rejected in zone | 🔴 Critical | Check metrics before enabling | ✅ `confirm: true` required |
 
 ### F.2 Legal Risk
 
@@ -268,6 +270,18 @@ The `subscription_engine_enabled` feature flag can be set to `false` by a `super
 | Deactivate key pharmacy | Coverage gap in zone | 🟠 High | Check `GET /admin/metrics?zone_id=` first |
 | Zone maintenance mode | All active requests freeze | 🔴 Critical | In-flight jobs complete; new users rejected |
 
+### F.4 Risk Delta (v3 Reduction)
+
+> [!NOTE]
+> The Confirmation Protocol and Audit Endpoint introduced in v3 directly reduce the following risks:
+
+| Risk | Before v3 | After v3 |
+|------|-----------|----------|
+| Accidental commission set to 0% | No friction — immediate effect | Must explicitly pass `confirm: true` |
+| Subscription engine silently disabled | No friction | `confirm: true` + audit record with `confirmed_by` |
+| Insurance routing misconfigured | No friction | `confirm: true` + instantly queryable via `/admin/audit/critical` |
+| Silent critical changes in incidents | No way to review quickly | `GET /admin/audit/critical` returns last 20 in < 20ms |
+
 ---
 
 ## G. Mandatory Invariants Summary
@@ -282,6 +296,8 @@ The `subscription_engine_enabled` feature flag can be set to `false` by a `super
 | **FC-6** | Feature flags wrap entire feature blocks — no partial execution |
 | **FC-7** | Any disabled feature defaults to fail-closed (safe state) |
 | **FC-8** | All PATCH routes require `super_admin` JWT, produce audit log, and are rate-limited |
+| **FC-9** | Critical setting changes require `{ confirm: true }` in the request body and are always auditable with `confirmed_by` |
+| **FC-10** | All critical config mutations must be queryable via a deterministic audit endpoint within < 20ms |
 
 ---
 
@@ -315,10 +331,212 @@ The `subscription_engine_enabled` feature flag can be set to `false` by a `super
 |:---:|------------|
 | 1 | Migration: `system_settings` + `feature_flags` tables + seeds |
 | 2 | `src/config/settingsCache.js` — LISTEN/NOTIFY + TTL fallback |
-| 3 | `src/services/settingsService.js` — CRUD + scope validation |
-| 4 | Admin PATCH routes with `super_admin` guard + audit integration |
+| 3 | `src/services/settingsService.js` — CRUD + scope validation + confirmation gate |
+| 4 | Admin PATCH routes with `super_admin` guard + confirmation enforcement + audit integration |
+| 4a | `GET /admin/audit/critical` endpoint + supporting index |
 | 5 | Controlled integration: `offerAcceptance` (commission), `routing-worker` (flags), `subscription-sweep` (flag), `order-sla-sweep` (SLA timeout) |
 | 6 | Full regression suite — must remain at 103+ passing tests |
+
+---
+
+---
+
+## L. Critical Change Confirmation Protocol (v3)
+
+### L.1 Problem
+
+High-impact setting mutations (commission rate, engine toggles, SLA timeout) can have immediate, irreversible platform-wide effects if misconfigured. A single PATCH without friction represents unacceptable operational risk at Zone-1 launch.
+
+### L.2 Design Decision: `{ confirm: true }` Flag
+
+> [!IMPORTANT]
+> **Chosen Pattern**: Single-request with mandatory `{ confirm: true }` body field.
+> The two-step pending_change model was evaluated and rejected — it introduces eventual inconsistency (pending state + expiry logic) and unnecessary table complexity.
+
+**Rationale for `{ confirm: true }` over two-step PATCH/confirm:**
+
+| Criterion | `{ confirm: true }` | Two-Step Model |
+|-----------|:---:|:---:|
+| No new transaction complexity | ✅ | ❌ (pending_changes table + expiry) |
+| No eventual inconsistency risk | ✅ | ❌ (pending row may never be confirmed) |
+| Emergency actions not blocked | ✅ | ❌ (requires two sequential requests under pressure) |
+| Additive only | ✅ | ❌ (requires new pending_changes table) |
+| Simple test coverage | ✅ | ❌ (state machine adds complexity) |
+
+### L.3 High-Impact Key Registry
+
+The following keys and flags are designated **critical** and require `{ confirm: true }`:
+
+| Key | Table | Impact |
+|-----|-------|--------|
+| `commission_rate_percent` | system_settings | Revenue directly affected |
+| `pharmacy_confirm_timeout_sec` | system_settings | SLA auto-cancel timing |
+| `subscription_engine_enabled` | feature_flags | All chronic patient orders |
+| `insurance_routing_enabled` | feature_flags | Insured routing path |
+| `rare_medicine_routing_enabled` | feature_flags | Rare medicine access |
+| `zones.maintenance_mode` | zones (Phase 10A) | Zone traffic blocked |
+
+### L.4 API Behavior
+
+For **any PATCH** targeting a critical key:
+
+```
+If body.confirm !== true:
+    → Return 400
+    {
+      "error": "confirmation_required",
+      "message": "This is a critical setting. Include { confirm: true } to proceed.",
+      "key": "commission_rate_percent"
+    }
+
+If body.confirm === true:
+    → Apply change atomically
+    → NOTIFY config_changed
+    → Emit audit log with confirmed: true, confirmed_by: actor_id
+    → Return 200
+```
+
+For **non-critical** keys, `{ confirm: true }` is optional and ignored.
+
+### L.5 Updated Audit Metadata for Critical Changes
+
+```json
+{
+  "entity_type": "system_setting",
+  "entity_id": "<uuid>",
+  "action": "setting.commission_rate_changed",
+  "actor_type": "admin",
+  "actor_id": "<super_admin_id>",
+  "metadata": {
+    "key": "commission_rate_percent",
+    "previous_value": "10.00",
+    "new_value": "0.00",
+    "confirmed": true,
+    "confirmed_by": "<super_admin_id>"
+  }
+}
+```
+
+> [!NOTE]
+> `confirmed_by` is the same as `actor_id` in single-request model. It serves as an explicit declaration that the actor acknowledged the high-impact nature of the change.
+
+### L.6 Emergency Bypass Protocol
+
+There is **no bypass** of `{ confirm: true }`. The field takes less than 1 second to add to an API call — it is friction, not a gate. Emergency actions (e.g., insurance routing off during an incident) are still executed in a single request by including `confirm: true`.
+
+### L.7 Transaction Safety Confirmation
+
+> The confirmation protocol introduces **zero new transaction complexity**:
+> - `{ confirm: true }` is a request body validation check — evaluated before the DB write
+> - The UPDATE and NOTIFY execute in the same autocommit block as before
+> - No pending state, no BEGIN/COMMIT change, no new table
+> - Audit INSERT follows immediately after UPDATE (same as all admin patches)
+
+---
+
+## M. Critical Audit Review Endpoint (v3)
+
+### M.1 Purpose
+
+Provides founders and operators a **rapid, deterministic** view of all critical configuration changes after any incident, config change, or routine review. Must return in < 20ms at 100k audit rows.
+
+### M.2 Endpoint Definition
+
+```
+GET /admin/audit/critical?limit=20
+```
+
+| Property | Value |
+|----------|-------|
+| Authentication | `super_admin` OR `admin` JWT |
+| Rate limit | 60 req/min per user |
+| Response | JSON array, DESC by `created_at` |
+| Default limit | 20 |
+| Max limit | 100 (enforced server-side) |
+| Read-only | Yes — pure SELECT |
+
+### M.3 High-Impact Action Allowlist
+
+Only the following `action` values are returned:
+
+```
+setting.commission_rate_changed
+setting.pharmacy_confirm_timeout_changed
+feature_flag.subscription_engine_changed
+feature_flag.insurance_routing_changed
+feature_flag.rare_medicine_routing_changed
+zone.maintenance_on
+zone.maintenance_off
+zone.deactivated
+pharmacy.blocked
+pharmacy.unblocked
+```
+
+### M.4 SQL Query
+
+```sql
+SELECT id, entity_type, entity_id, action, actor_type, actor_id, metadata, created_at
+FROM audit_logs
+WHERE action = ANY($1::text[])
+ORDER BY created_at DESC
+LIMIT $2;
+```
+
+`$1` = the action allowlist array (hardcoded in service layer)  
+`$2` = `Math.min(limit, 100)`
+
+### M.5 Required Index (Performance)
+
+For < 20ms at 100k rows, a **partial index** on high-impact actions is required:
+
+```sql
+CREATE INDEX idx_audit_logs_critical_actions
+  ON audit_logs (created_at DESC)
+  WHERE action IN (
+    'setting.commission_rate_changed',
+    'setting.pharmacy_confirm_timeout_changed',
+    'feature_flag.subscription_engine_changed',
+    'feature_flag.insurance_routing_changed',
+    'feature_flag.rare_medicine_routing_changed',
+    'zone.maintenance_on',
+    'zone.maintenance_off',
+    'zone.deactivated',
+    'pharmacy.blocked',
+    'pharmacy.unblocked'
+  );
+```
+
+This partial index covers only ~0.1% of typical audit_log rows, making it small and fast even at millions of total rows.
+
+### M.6 Response Schema
+
+```json
+[
+  {
+    "id": "uuid",
+    "entity_type": "system_setting",
+    "entity_id": "uuid",
+    "action": "setting.commission_rate_changed",
+    "actor_type": "admin",
+    "actor_id": "uuid",
+    "metadata": {
+      "key": "commission_rate_percent",
+      "previous_value": "10.00",
+      "new_value": "0.00",
+      "confirmed": true,
+      "confirmed_by": "uuid"
+    },
+    "created_at": "2026-03-03T18:00:00Z"
+  }
+]
+```
+
+### M.7 Concurrency & Performance
+
+- Pure read-only SELECT — no locking, no contention
+- Partial index makes this O(log · k) where k = critical audit rows (typically << total)
+- At 100k total audit rows with 1k critical rows: index scan returns 20 rows in < 5ms
+- No pagination complexity — LIMIT-only is sufficient for operational review cadence
 
 ---
 
