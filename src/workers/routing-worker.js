@@ -97,7 +97,8 @@ async function claimNextJob() {
 
         const { rows } = await client.query(`
             SELECT rj.id, rj.request_id, rj.status, rj.current_wave,
-                   r.type AS request_type, r.zone_id, r.expires_at
+                   r.type AS request_type, r.zone_id, r.expires_at,
+                   r.insurance_profile_id
             FROM routing_jobs rj
             JOIN requests r ON r.id = rj.request_id
             WHERE rj.status = 'pending'
@@ -211,9 +212,31 @@ async function activateWave(client, wave, jobId) {
  * Query eligible pharmacies for a wave.
  * Standard requests: zone-filtered.
  * Rare requests: cross-zone, supports_rare = true.
+ * Insurance filter: if request has insurance_profile_id, apply JOIN-based
+ * eligibility filter through pharmacy_insurance_contracts.
+ *
+ * Insurance affects ELIGIBILITY only, not RANKING.
+ * ORDER BY trust_score DESC is preserved in all paths.
  */
 async function queryEligiblePharmacies(job, tierId) {
     if (job.request_type === 'rare') {
+        // ── Rare path ────────────────────────────────────────────────────
+        if (job.insurance_profile_id) {
+            const { rows } = await query(`
+                SELECT p.id FROM pharmacies p
+                JOIN pharmacy_insurance_contracts pic ON pic.pharmacy_id = p.id
+                JOIN user_insurance_profiles uip ON uip.insurance_company_id = pic.insurance_company_id
+                WHERE p.tier_id = $1
+                  AND p.is_active = true
+                  AND p.supports_rare = true
+                  AND uip.id = $2
+                  AND pic.is_active = true
+                  AND uip.is_active = true
+                ORDER BY p.trust_score DESC
+            `, [tierId, job.insurance_profile_id]);
+            return rows;
+        }
+
         const { rows } = await query(`
             SELECT id FROM pharmacies
             WHERE tier_id = $1
@@ -221,6 +244,23 @@ async function queryEligiblePharmacies(job, tierId) {
               AND supports_rare = true
             ORDER BY trust_score DESC
         `, [tierId]);
+        return rows;
+    }
+
+    // ── Standard path ────────────────────────────────────────────────────
+    if (job.insurance_profile_id) {
+        const { rows } = await query(`
+            SELECT p.id FROM pharmacies p
+            JOIN pharmacy_insurance_contracts pic ON pic.pharmacy_id = p.id
+            JOIN user_insurance_profiles uip ON uip.insurance_company_id = pic.insurance_company_id
+            WHERE p.zone_id = $1
+              AND p.tier_id = $2
+              AND p.is_active = true
+              AND uip.id = $3
+              AND pic.is_active = true
+              AND uip.is_active = true
+            ORDER BY p.trust_score DESC
+        `, [job.zone_id, tierId, job.insurance_profile_id]);
         return rows;
     }
 
