@@ -14,7 +14,6 @@ jest.mock('../src/config/db', () => ({
 }));
 
 jest.mock('../src/config/settingsCache', () => ({
-    getSettingMeta: jest.fn(),
     refresh: jest.fn().mockResolvedValue(),
 }));
 
@@ -26,47 +25,45 @@ beforeEach(() => {
 
 describe('settingsService.updateSetting', () => {
 
-    test('throws 404 NOT_FOUND if key not in cache', async () => {
-        settingsCache.getSettingMeta.mockReturnValue(null);
+    test('throws 404 NOT_FOUND if key not in DB', async () => {
+        query.mockResolvedValueOnce({ rows: [] });
         await expect(settingsService.updateSetting('unknown_key', '10', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'NOT_FOUND', message: 'setting_not_found' });
     });
 
     test('throws 403 FORBIDDEN if setting is locked', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ is_locked: true });
+        query.mockResolvedValueOnce({ rows: [{ is_locked: true, type: 'integer', max_val: null, min_val: null, value: '5' }] });
         await expect(settingsService.updateSetting('locked_key', '10', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'FORBIDDEN', message: 'setting_locked' });
     });
 
     test('throws 400 BAD_REQUEST for type mismatch (boolean expects true/false)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'boolean', is_locked: false });
+        query.mockResolvedValueOnce({ rows: [{ type: 'boolean', is_locked: false, max_val: null, min_val: null, value: 'true' }] });
         await expect(settingsService.updateSetting('bool_key', 'yes', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'invalid_type: expected "true" or "false"' });
     });
 
     test('throws 400 BAD_REQUEST for type mismatch (integer expects integer)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'integer', is_locked: false });
+        query.mockResolvedValueOnce({ rows: [{ type: 'integer', is_locked: false, max_val: null, min_val: null, value: '5' }] });
         await expect(settingsService.updateSetting('int_key', '10.5', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'invalid_type: expected integer' });
     });
 
     test('throws 400 BAD_REQUEST for exceeding max_val (integer)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'integer', max_val: '100', is_locked: false });
+        query.mockResolvedValueOnce({ rows: [{ type: 'integer', max_val: '100', is_locked: false, value: '50' }] });
         await expect(settingsService.updateSetting('int_key', '101', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'exceeds_maximum: max allowed is 100' });
     });
 
     test('throws 400 BAD_REQUEST for dropping below min_val (decimal)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'decimal', min_val: '5.00', is_locked: false });
+        query.mockResolvedValueOnce({ rows: [{ type: 'decimal', min_val: '5.00', is_locked: false, value: '10.00' }] });
         await expect(settingsService.updateSetting('dec_key', '4.99', DUMMY_ACTOR_ID))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'below_minimum: min allowed is 5.00' });
     });
 
     test('accepts 0% for commission_rate_percent (no min_val limit)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'decimal', min_val: null, max_val: '30.00', is_locked: false });
-
         // Mock current DB value fetch
-        query.mockResolvedValueOnce({ rows: [{ value: '10.00' }] });
+        query.mockResolvedValueOnce({ rows: [{ type: 'decimal', min_val: null, max_val: '30.00', is_locked: false, value: '10.00' }] });
         // Mock UPDATE
         query.mockResolvedValueOnce({});
         // Mock NOTIFY
@@ -82,7 +79,7 @@ describe('settingsService.updateSetting', () => {
     });
 
     test('throws 400 BAD_REQUEST if critical key missing confirmFlag (strict check)', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'decimal', max_val: '30.00', is_locked: false });
+        query.mockResolvedValue({ rows: [{ type: 'decimal', max_val: '30.00', is_locked: false, value: '10.00' }] });
 
         // Pass 1, 'true', undefined -> all should fail
         await expect(settingsService.updateSetting('commission_rate_percent', '10.00', DUMMY_ACTOR_ID, undefined))
@@ -96,16 +93,14 @@ describe('settingsService.updateSetting', () => {
     });
 
     test('success sequence executes UPDATE -> NOTIFY -> refresh', async () => {
-        settingsCache.getSettingMeta.mockReturnValue({ type: 'integer', min_val: '1', max_val: '20', is_locked: false });
-
-        query.mockResolvedValueOnce({ rows: [{ value: '5' }] }); // SELECT current
+        query.mockResolvedValueOnce({ rows: [{ type: 'integer', min_val: '1', max_val: '20', is_locked: false, value: '5' }] }); // SELECT current
         query.mockResolvedValueOnce({}); // UPDATE
         query.mockResolvedValueOnce({}); // NOTIFY
 
         await settingsService.updateSetting('max_active_requests_per_user', '10', DUMMY_ACTOR_ID);
 
         // Sequence verifications
-        expect(query).toHaveBeenNthCalledWith(1, expect.stringContaining('SELECT value FROM system_settings'), ['max_active_requests_per_user']);
+        expect(query).toHaveBeenNthCalledWith(1, expect.stringContaining('SELECT id, value, type, min_val, max_val, is_locked FROM system_settings'), ['max_active_requests_per_user']);
         expect(query).toHaveBeenNthCalledWith(2, expect.stringContaining('UPDATE system_settings'), ['10', DUMMY_ACTOR_ID, 'max_active_requests_per_user']);
         expect(query).toHaveBeenNthCalledWith(3, 'NOTIFY config_changed');
 

@@ -74,13 +74,20 @@ function _validateTypeAndBounds(valueStr, meta) {
  * @throws {Error} specific constraint violations catching (400/403/404) at router
  */
 async function updateSetting(key, newValue, actorId, confirmFlag) {
-    // 1. Key exists
-    const meta = settingsCache.getSettingMeta(key);
-    if (!meta) {
+    // 1. Fetch current meta and value directly from DB (Cache is read-only)
+    const prevRes = await query(
+        'SELECT id, value, type, min_val, max_val, is_locked FROM system_settings WHERE key = $1',
+        [key]
+    );
+
+    if (prevRes.rows.length === 0) {
         const error = new Error('setting_not_found');
         error.code = 'NOT_FOUND';
         throw error;
     }
+
+    const meta = prevRes.rows[0];
+    const previous_value = meta.value;
 
     // 2. is_locked check
     if (meta.is_locked) {
@@ -105,11 +112,7 @@ async function updateSetting(key, newValue, actorId, confirmFlag) {
         throw error;
     }
 
-    // 7. Read previous value (from DB to ensure latest true value for audit)
-    const currentRes = await query('SELECT value FROM system_settings WHERE key = $1', [key]);
-    const previous_value = currentRes.rows[0].value;
-
-    // 8. UPDATE (autocommit)
+    // 7. UPDATE (autocommit)
     await query(
         `UPDATE system_settings
          SET value = $1, updated_by = $2, updated_at = now()
@@ -117,10 +120,10 @@ async function updateSetting(key, newValue, actorId, confirmFlag) {
         [newValue, actorId, key]
     );
 
-    // 9. NOTIFY config_changed BEFORE local refresh
+    // 8. NOTIFY config_changed BEFORE local refresh
     await query(`NOTIFY config_changed`);
 
-    // 10. Local refresh
+    // 9. Local refresh
     await settingsCache.refresh();
 
     // Return audit format piece
