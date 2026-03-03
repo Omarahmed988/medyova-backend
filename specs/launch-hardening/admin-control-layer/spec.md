@@ -1,6 +1,6 @@
 # Admin Control Layer — Specification
 
-> **Status**: v1 — Draft (Pending Architectural Review)  
+> **Status**: v2 — Approved (Corrections Applied)  
 > **Layer**: 10A (Launch Hardening — Governance)  
 > **Depends on**: All prior layers (zones, pharmacies, requests, routing, offers, orders, subscriptions, insurance)
 
@@ -24,12 +24,16 @@ This specification defines a **minimal admin governance layer** that provides Zo
 
 #### Maintenance Mode Semantics
 
+> [!IMPORTANT]
+> `maintenance_mode` is enforced ONLY at `claimNextJob()` level. It must NOT be checked in `executeWave()`, `processJob()`, `queryEligiblePharmacies()`, `waitForWaveWindow()`, or any other function.
+
 When `zones.maintenance_mode = true`:
-1. `claimNextJob()` adds `AND z.maintenance_mode = false` to its WHERE clause (join zones via request)
-2. Existing active jobs are NOT interrupted — they complete their current wave naturally
-3. No new jobs are claimed for this zone
+1. `claimNextJob()` adds `JOIN zones z ON z.id = r.zone_id` and `AND z.maintenance_mode = false` to its WHERE clause
+2. **Already active jobs are NOT interrupted** — they complete their current wave and full tier escalation naturally
+3. No new jobs are claimed for this zone until maintenance mode is lifted
 4. Pre-existing offers remain visible and acceptable
 5. Order lifecycle is unaffected
+6. `executeWave()` does NOT check maintenance mode — once a job is claimed, it runs to completion
 
 ### 2.2 Pharmacy Control
 
@@ -47,8 +51,16 @@ When `zones.maintenance_mode = true`:
 
 #### Emergency Block Semantics
 
-- `is_blocked = true` acts as a hard filter in `queryEligiblePharmacies()`: `AND p.is_blocked = false`
+> [!IMPORTANT]
+> `is_blocked` must be enforced in exactly **two** locations. No other routing modifications allowed.
+
+| Location | Change |
+|----------|--------|
+| `routing-worker.js` → `queryEligiblePharmacies()` | Add `AND p.is_blocked = false` to all 4 query paths |
+| `src/services/offerSelection.js` | Add `AND p.is_blocked = false` to pharmacy JOIN |
+
 - Blocked pharmacies' existing offers remain in the system but are NOT shown in offer selection
+- `is_blocked` is NOT checked in `claimNextJob()`, `executeWave()`, `processJob()`, or any other function
 - `offerSelection.js` adds `AND p.is_blocked = false` to its pharmacy join
 
 ### 2.3 Insurance Control

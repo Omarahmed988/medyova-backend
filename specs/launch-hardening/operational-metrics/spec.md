@@ -1,6 +1,6 @@
 # Operational Metrics — Specification
 
-> **Status**: v1 — Draft (Pending Architectural Review)  
+> **Status**: v2 — Approved (Corrections Applied)  
 > **Layer**: 10C (Launch Hardening — Observability)  
 > **Depends on**: All data layers (requests, routing_jobs, orders, subscriptions)
 
@@ -101,11 +101,15 @@ WHERE status = 'active';
 
 ### 4.3 Orders Pending Confirmation
 
+> [!IMPORTANT]
+> `orders` table does NOT contain `zone_id`. Must JOIN `requests` for zone filtering.
+
 ```sql
 SELECT COUNT(*) AS orders_pending
-FROM orders
-WHERE status = 'pending'
-  AND ($1::uuid IS NULL OR zone_id IS NOT NULL);
+FROM orders o
+JOIN requests r ON r.id = o.request_id
+WHERE o.status = 'pending'
+  AND ($1::uuid IS NULL OR r.zone_id = $1);
 ```
 
 ### 4.4 Orders in Delivery
@@ -120,11 +124,16 @@ WHERE o.status = 'out_for_delivery'
 
 ### 4.5 Stale Routing Jobs
 
+> [!NOTE]
+> Supports optional zone filtering via JOIN requests (future-proofing).
+
 ```sql
 SELECT COUNT(*) AS stale_jobs
-FROM routing_jobs
-WHERE status = 'active'
-  AND updated_at < now() - interval '10 minutes';
+FROM routing_jobs rj
+JOIN requests r ON r.id = rj.request_id
+WHERE rj.status = 'active'
+  AND rj.updated_at < now() - interval '10 minutes'
+  AND ($1::uuid IS NULL OR r.zone_id = $1);
 ```
 
 ### 4.6 Failed Subscription Pre-checks
@@ -148,21 +157,27 @@ GROUP BY status;
 
 ## 5. Index Requirements
 
-| Query | Required Index | Exists? |
+| Query | Required Index | Status |
 |-------|---------------|:---:|
-| Active requests by state | `idx_requests_state` (state) | ⚠️ Check — may need to add |
+| Active requests by state | `idx_requests_state` | ⚠️ Must add |
 | Routing jobs by status | `idx_routing_jobs_status` | ✅ Exists |
-| Orders by status | `idx_orders_status` | ✅ Exists |
-| Stale jobs by updated_at | `idx_routing_jobs_status` + `updated_at` | ⚠️ May add composite |
-| Subscriptions precheck | `idx_subscriptions_precheck_status` | ⚠️ May add partial |
+| Orders by status | `idx_orders_status` | ⚠️ Must add |
+| Stale jobs (composite) | `idx_routing_jobs_stale` | ⚠️ Must add |
+| Subscriptions precheck | Existing indexes sufficient | ✅ Ok |
 
-### New Indexes (if needed)
+### Required Indexes (in migration)
 
 ```sql
-CREATE INDEX idx_requests_state ON requests (state);
-CREATE INDEX idx_routing_jobs_stale ON routing_jobs (status, updated_at)
+CREATE INDEX idx_requests_state ON requests(state);
+
+CREATE INDEX idx_routing_jobs_stale
+  ON routing_jobs(status, updated_at)
   WHERE status = 'active';
+
+CREATE INDEX idx_orders_status ON orders(status);
 ```
+
+All three indexes are created in Phase 10 Step 4 migration.
 
 ---
 

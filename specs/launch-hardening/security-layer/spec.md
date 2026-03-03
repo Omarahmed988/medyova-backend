@@ -1,6 +1,6 @@
 # Rate Limiting & Security Layer — Specification
 
-> **Status**: v1 — Draft (Pending Architectural Review)  
+> **Status**: v2 — Approved (Constraints Confirmed)  
 > **Layer**: 10D (Launch Hardening — Security)  
 > **Depends on**: All request-handling layers
 
@@ -29,7 +29,14 @@ This specification defines **rate limiting, abuse protection, and input validati
 
 ### 2.3 Implementation: `express-rate-limit`
 
-In-memory store is acceptable for single-instance Zone-1 deployment. No Redis required.
+In-memory store is acceptable for **Zone-1 single-instance deployment only**. If horizontal scaling is applied (multiple API instances), must migrate to Redis-backed store.
+
+> [!IMPORTANT]
+> **Rate limiting constraints (confirmed):**
+> 1. Rate limiting middleware runs BEFORE any transactional handler (Express middleware chain order)
+> 2. No rate limiting logic exists inside service files (`offerAcceptance.js`, `orderService.js`, etc.)
+> 3. In-memory limiter is acceptable for Zone-1 only — document migration path to Redis
+> 4. No changes to routing workers — workers are internal processes, not API-facing
 
 ---
 

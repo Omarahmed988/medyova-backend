@@ -1,6 +1,6 @@
 # Deployment Architecture — Specification (Zone-1 Strategy)
 
-> **Status**: v1 — Draft (Pending Architectural Review)  
+> **Status**: v2 — Approved  
 > **Layer**: 10E (Launch Hardening — Infrastructure)  
 > **Depends on**: All application layers + hardening specs 10A–10D
 

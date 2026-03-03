@@ -1,6 +1,6 @@
 # Audit Logging Layer — Specification
 
-> **Status**: v1 — Draft (Pending Architectural Review)  
+> **Status**: v2 — Approved (Corrections Applied)  
 > **Layer**: 10B (Launch Hardening — Observability)  
 > **Depends on**: Layer 10A (Admin Control Layer)
 
@@ -41,6 +41,21 @@ This specification defines a **structured audit logging system** for Medyova. Th
 - **No UPDATE** — audit logs are append-only. No UPDATE or DELETE operations permitted.
 - **No FK** on `entity_id` — entities may be soft-deleted, and audit logs must persist independently.
 - **No FK** on `actor_id` — actor may be external or system.
+
+### 2.4 DB-Level Mutation Protection
+
+> [!CAUTION]
+> A PostgreSQL RULE must be created to prevent accidental UPDATE or DELETE on `audit_logs`.
+
+```sql
+CREATE RULE audit_logs_no_update AS
+  ON UPDATE TO audit_logs DO INSTEAD NOTHING;
+
+CREATE RULE audit_logs_no_delete AS
+  ON DELETE TO audit_logs DO INSTEAD NOTHING;
+```
+
+This provides defense-in-depth beyond application-level enforcement. Even direct SQL access cannot mutate audit records.
 
 ---
 
@@ -132,16 +147,49 @@ This specification defines a **structured audit logging system** for Medyova. Th
 > [!IMPORTANT]
 > **Audit logging must NOT block primary transactions.** For same-transaction inserts, the INSERT is a simple append with no FK validation (no foreign keys on `entity_id` or `actor_id`). This adds < 1ms to each transaction.
 
+### 5.2 Insert Timing: BEFORE COMMIT
+
+For all critical-path same-transaction inserts (acceptance, order transitions, subscription generation):
+- The audit INSERT is placed as the **second-to-last statement** before `COMMIT`
+- This guarantees: if the transaction commits, the audit record exists; if it rolls back, neither exists
+
+### 5.3 Admin Path: Failure Isolation
+
+For admin PATCH endpoints:
+- The admin UPDATE executes first (autocommit)
+- The audit INSERT runs after, wrapped in `try/catch`
+- **If the audit INSERT fails**, the admin action is NOT rolled back — it has already committed
+- The error is logged to stderr but does not propagate to the HTTP response
+- The admin receives `200 OK` regardless of audit success
+
+### 5.4 No Unhandled Exceptions
+
+> [!WARNING]
+> `auditService.log()` must NEVER throw an unhandled exception. All calls must be wrapped in try/catch:
+
+```javascript
+// Inside transaction (critical path)
+try {
+    await auditService.log(client, { ... });
+} catch (auditErr) {
+    console.error('Audit insert failed (non-fatal):', auditErr.message);
+    // Do NOT re-throw — transaction continues to COMMIT
+}
+```
+
+This is enforced by invariant **AL-5**.
+
 ---
 
 ## 6. Invariants
 
 | ID | Invariant | Enforcement |
 |----|-----------|-------------|
-| **AL-1** | Audit logs are append-only | Application: no UPDATE/DELETE endpoints. DB: can add rule/trigger to prevent. |
-| **AL-2** | Critical state changes always produce an audit record | Same-transaction insert guarantees atomicity |
+| **AL-1** | Audit logs are append-only | DB RULE prevents UPDATE/DELETE. Application: no mutation endpoints. |
+| **AL-2** | Critical state changes always produce an audit record | Same-transaction insert before COMMIT guarantees atomicity |
 | **AL-3** | Audit log failure does not block admin operations | Admin path uses try/catch on INSERT |
 | **AL-4** | `created_at` is server-side `now()` — not client-provided | DB DEFAULT, not application-set |
+| **AL-5** | `auditService.log()` never throws unhandled exceptions | All calls wrapped in try/catch |
 
 ---
 
