@@ -170,3 +170,83 @@ describe('PATCH /admin/flags/:key', () => {
         expect(res.status).toBe(200); // Route still succeeds
     });
 });
+
+describe('GET /admin/audit/critical', () => {
+    test('returns 400 if actor_id is not a valid UUID', async () => {
+        const res = await request(app)
+            .get('/admin/audit/critical?actor_id=invalid-string')
+            .set('x-mock-user', SUPER_ADMIN);
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/valid UUID/);
+    });
+
+    test('returns 400 if start_date is not a valid ISO string', async () => {
+        const res = await request(app)
+            .get('/admin/audit/critical?start_date=not-a-date')
+            .set('x-mock-user', SUPER_ADMIN);
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/valid ISO8601/);
+    });
+
+    test('applies default pagination limits (limit=20, offset=0)', async () => {
+        query.mockResolvedValueOnce({ rows: [] });
+
+        const res = await request(app)
+            .get('/admin/audit/critical')
+            .set('x-mock-user', SUPER_ADMIN);
+
+        expect(res.status).toBe(200);
+        expect(res.body.meta.limit).toBe(20);
+        expect(res.body.meta.offset).toBe(0);
+
+        // verify limit and offset bindings are passed as 6th and 7th args correctly
+        expect(query).toHaveBeenCalledWith(
+            expect.stringContaining('LIMIT $6 OFFSET $7'),
+            [null, null, null, null, null, 20, 0]
+        );
+    });
+
+    test('clamps explicit limit that exceeds 100 back to 20', async () => {
+        query.mockResolvedValueOnce({ rows: [] });
+
+        const res = await request(app)
+            .get('/admin/audit/critical?limit=500&offset=5')
+            .set('x-mock-user', SUPER_ADMIN);
+
+        expect(res.status).toBe(200);
+        expect(res.body.meta.limit).toBe(20); // successfully clamped
+        expect(res.body.meta.offset).toBe(5);
+        expect(query).toHaveBeenCalledWith(
+            expect.any(String),
+            [null, null, null, null, null, 20, 5]
+        );
+    });
+
+    test('executes strict query with provided sanitized filters', async () => {
+        query.mockResolvedValueOnce({ rows: [{ id: 1 }] });
+
+        const validDate = new Date().toISOString();
+
+        const res = await request(app)
+            .get(`/admin/audit/critical?action=UPDATE_SETTING&key=foo&actor_id=123e4567-e89b-12d3-a456-426614174000&start_date=${validDate}`)
+            .set('x-mock-user', SUPER_ADMIN);
+
+        expect(res.status).toBe(200);
+        expect(res.body.data.length).toBe(1);
+
+        expect(query).toHaveBeenCalledWith(
+            expect.stringContaining("WHERE target_type IN ('system_settings', 'feature_flags')"),
+            [
+                'UPDATE_SETTING',                       // $1 action
+                'foo',                                  // $2 key
+                '123e4567-e89b-12d3-a456-426614174000', // $3 actor_id
+                expect.any(String),                     // $4 start_date
+                null,                                   // $5 end_date
+                20,                                     // $6 limit
+                0                                       // $7 offset
+            ]
+        );
+    });
+});
