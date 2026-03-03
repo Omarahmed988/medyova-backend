@@ -89,6 +89,16 @@ async function updateSetting(key, newValue, actorId, confirmFlag) {
     const meta = prevRes.rows[0];
     const previous_value = meta.value;
 
+    // Fast-path idempotency check
+    if (previous_value === newValue) {
+        return {
+            key,
+            previous_value,
+            new_value: newValue,
+            status: 'no_change'
+        };
+    }
+
     // 2. is_locked check
     if (meta.is_locked) {
         const error = new Error('setting_locked');
@@ -130,7 +140,8 @@ async function updateSetting(key, newValue, actorId, confirmFlag) {
     return {
         key,
         previous_value,
-        new_value: newValue
+        new_value: newValue,
+        status: 'updated'
     };
 }
 
@@ -198,6 +209,18 @@ async function updateFlag(key, isEnabled, scope, scopeId, actorId, confirmFlag) 
 
     const previous_value = stateRes.rows[0].is_enabled;
 
+    // Fast-path idempotency check
+    if (previous_value === isEnabled) {
+        return {
+            key,
+            scope,
+            scope_id: scopeId,
+            previous_value,
+            new_value: isEnabled,
+            status: 'no_change'
+        };
+    }
+
     // Ensure boolean
     if (typeof isEnabled !== 'boolean') {
         const error = new Error('invalid_type: isEnabled must be boolean');
@@ -221,7 +244,8 @@ async function updateFlag(key, isEnabled, scope, scopeId, actorId, confirmFlag) 
         scope,
         scope_id: scopeId,
         previous_value,
-        new_value: isEnabled
+        new_value: isEnabled,
+        status: 'updated'
     };
 }
 

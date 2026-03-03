@@ -74,21 +74,39 @@ describe('settingsService.updateSetting', () => {
         expect(res).toEqual({
             key: 'commission_rate_percent',
             previous_value: '10.00',
-            new_value: '0.00'
+            new_value: '0.00',
+            status: 'updated'
         });
+    });
+
+    test('returns status: no_change when previous_value === newValue without writing', async () => {
+        // Mock validation DB read matching the exact new value
+        query.mockResolvedValueOnce({ rows: [{ type: 'integer', max_val: '20', is_locked: false, value: '10' }] });
+
+        const res = await settingsService.updateSetting('max_active_requests_per_user', '10', DUMMY_ACTOR_ID);
+
+        expect(res).toEqual({
+            key: 'max_active_requests_per_user',
+            previous_value: '10',
+            new_value: '10',
+            status: 'no_change'
+        });
+
+        // Ensure ONLY the SELECT was executed (so no UPDATE, NOTIFY)
+        expect(query).toHaveBeenCalledTimes(1);
     });
 
     test('throws 400 BAD_REQUEST if critical key missing confirmFlag (strict check)', async () => {
         query.mockResolvedValue({ rows: [{ type: 'decimal', max_val: '30.00', is_locked: false, value: '10.00' }] });
 
         // Pass 1, 'true', undefined -> all should fail
-        await expect(settingsService.updateSetting('commission_rate_percent', '10.00', DUMMY_ACTOR_ID, undefined))
+        await expect(settingsService.updateSetting('commission_rate_percent', '12.00', DUMMY_ACTOR_ID, undefined))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: expect.stringContaining('confirmation_required') });
 
-        await expect(settingsService.updateSetting('commission_rate_percent', '10.00', DUMMY_ACTOR_ID, 'true'))
+        await expect(settingsService.updateSetting('commission_rate_percent', '12.00', DUMMY_ACTOR_ID, 'true'))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: expect.stringContaining('confirmation_required') });
 
-        await expect(settingsService.updateSetting('commission_rate_percent', '10.00', DUMMY_ACTOR_ID, 1))
+        await expect(settingsService.updateSetting('commission_rate_percent', '12.00', DUMMY_ACTOR_ID, 1))
             .rejects.toMatchObject({ code: 'BAD_REQUEST', message: expect.stringContaining('confirmation_required') });
     });
 
@@ -177,8 +195,27 @@ describe('settingsService.updateFlag', () => {
             scope: 'global',
             scope_id: null,
             previous_value: true,
-            new_value: false
+            new_value: false,
+            status: 'updated'
         });
+    });
+
+    test('returns status: no_change when previous_value === isEnabled without writing', async () => {
+        query.mockResolvedValueOnce({ rows: [{ is_enabled: true }] }); // SELECT current state
+
+        const res = await settingsService.updateFlag('offer_visibility_enabled', true, 'global', null, DUMMY_ACTOR_ID);
+
+        expect(res).toEqual({
+            key: 'offer_visibility_enabled',
+            scope: 'global',
+            scope_id: null,
+            previous_value: true,
+            new_value: true,
+            status: 'no_change'
+        });
+
+        // Verify only the SELECT ran
+        expect(query).toHaveBeenCalledTimes(1);
     });
 
     test('success sequence works for Zone scope', async () => {
