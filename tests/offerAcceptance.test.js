@@ -31,6 +31,11 @@ jest.mock('../src/config/db', () => {
         },
     };
 });
+jest.mock('../src/config/settingsCache', () => ({
+    isReady: jest.fn().mockReturnValue(true),
+    getSetting: jest.fn().mockReturnValue('10.00'),
+    getSettingNumber: jest.fn().mockReturnValue(10.00),
+}));
 
 const request = require('supertest');
 const app = require('../src/app');

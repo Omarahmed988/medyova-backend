@@ -97,7 +97,7 @@ async function claimNextJob() {
 
         const { rows } = await client.query(`
             SELECT rj.id, rj.request_id, rj.status, rj.current_wave,
-                   r.type AS request_type, r.zone_id, r.expires_at,
+                   r.type AS request_type, r.zone_id, r.area_id, r.expires_at,
                    r.insurance_profile_id
             FROM routing_jobs rj
             JOIN requests r ON r.id = rj.request_id
@@ -251,26 +251,32 @@ async function queryEligiblePharmacies(job, tierId) {
     if (job.insurance_profile_id) {
         const { rows } = await query(`
             SELECT p.id FROM pharmacies p
+            JOIN pharmacy_delivery_areas pda
+              ON pda.pharmacy_id = p.id
             JOIN pharmacy_insurance_contracts pic ON pic.pharmacy_id = p.id
             JOIN user_insurance_profiles uip ON uip.insurance_company_id = pic.insurance_company_id
             WHERE p.zone_id = $1
-              AND p.tier_id = $2
+              AND pda.area_id = $2
+              AND p.tier_id = $3
               AND p.is_active = true
-              AND uip.id = $3
+              AND uip.id = $4
               AND pic.is_active = true
               AND uip.is_active = true
             ORDER BY p.trust_score DESC
-        `, [job.zone_id, tierId, job.insurance_profile_id]);
+        `, [job.zone_id, job.area_id, tierId, job.insurance_profile_id]);
         return rows;
     }
 
     const { rows } = await query(`
-        SELECT id FROM pharmacies
-        WHERE zone_id = $1
-          AND tier_id = $2
-          AND is_active = true
-        ORDER BY trust_score DESC
-    `, [job.zone_id, tierId]);
+        SELECT p.id FROM pharmacies p
+        JOIN pharmacy_delivery_areas pda
+          ON pda.pharmacy_id = p.id
+        WHERE p.zone_id = $1
+          AND pda.area_id = $2
+          AND p.tier_id = $3
+          AND p.is_active = true
+        ORDER BY p.trust_score DESC
+    `, [job.zone_id, job.area_id, tierId]);
     return rows;
 }
 
@@ -761,6 +767,19 @@ async function processJob(job) {
     const finalState = await determineRequestState(job.request_id);
 
     await completeJobWithState(job.id, job.request_id, finalState);
+
+    // Phase 20 Strategy: Emit demand signal if routing failed completely (0 offers)
+    if (finalState === 'expired') {
+        try {
+            const DemandSignalService = require('../services/demandSignalService');
+            const itemsRes = await query(`SELECT medicine_id FROM request_items WHERE request_id = $1`, [job.request_id]);
+            for (const item of itemsRes.rows) {
+                DemandSignalService.emit('routing_failure', 'prescription_routing', item.medicine_id, job.area_id);
+            }
+        } catch (err) {
+            log('warn', 'signal_emission_error', { error: err.message });
+        }
+    }
 
     metrics.jobs_processed++;
     if (finalState === 'partially_offered') metrics.partial_completions++;

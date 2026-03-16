@@ -17,10 +17,7 @@
  */
 
 const { pool } = require('../config/db');
-
-const PHARMACY_CONFIRM_TIMEOUT_SEC = parseInt(
-    process.env.PHARMACY_CONFIRM_TIMEOUT_SEC || '900', 10
-);
+const settingsCache = require('../config/settingsCache');
 
 const ORDER_SLA_POLL_INTERVAL_SEC = parseInt(
     process.env.ORDER_SLA_POLL_INTERVAL_SEC || '60', 10
@@ -32,6 +29,9 @@ const ORDER_SLA_POLL_INTERVAL_SEC = parseInt(
  * @returns {Promise<{processed: number, cancelled: string[]}>}
  */
 async function runSweep() {
+    // ── Phase 11: Option A Snapshot ──
+    const confirmTimeoutSec = settingsCache.getSettingNumber('pharmacy_confirm_timeout_sec', 900);
+
     const client = await pool.connect();
     const cancelled = [];
 
@@ -41,7 +41,7 @@ async function runSweep() {
         const staleOrders = await client.query(
             `SELECT id FROM orders
              WHERE status = 'pending'
-               AND created_at < now() - interval '${PHARMACY_CONFIRM_TIMEOUT_SEC} seconds'
+               AND created_at < now() - interval '${confirmTimeoutSec} seconds'
              FOR UPDATE SKIP LOCKED`,
         );
 
@@ -82,7 +82,7 @@ async function runSweep() {
                     event: 'order_auto_cancelled',
                     order_id: row.id,
                     reason: 'confirmation_timeout',
-                    timeout_sec: PHARMACY_CONFIRM_TIMEOUT_SEC,
+                    timeout_sec: confirmTimeoutSec,
                     timestamp: new Date().toISOString(),
                 }));
             } catch (err) {
@@ -158,6 +158,5 @@ function startSweepLoop() {
 module.exports = {
     runSweep,
     startSweepLoop,
-    PHARMACY_CONFIRM_TIMEOUT_SEC,
     ORDER_SLA_POLL_INTERVAL_SEC,
 };

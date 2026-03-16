@@ -28,6 +28,11 @@ jest.mock('../src/config/db', () => {
         },
     };
 });
+jest.mock('../src/config/settingsCache', () => ({
+    isReady: jest.fn().mockReturnValue(true),
+    getSetting: jest.fn().mockReturnValue('10.00'),
+    getSettingNumber: jest.fn().mockReturnValue(10.00),
+}));
 
 const { pool } = require('../src/config/db');
 
@@ -342,7 +347,7 @@ describe('Acceptance Service — Step 8 (Order Creation)', () => {
         mockClient.release.mockReset();
     });
 
-    const { acceptOffer, COMMISSION_RATE_PERCENT } = require('../src/services/offerAcceptance');
+    const { acceptOffer } = require('../src/services/offerAcceptance');
 
     test('Step 8 INSERT is included in acceptance transaction', async () => {
         const orderUUID = '990e8400-e29b-41d4-a716-446655440099';
@@ -372,7 +377,7 @@ describe('Acceptance Service — Step 8 (Order Creation)', () => {
 
         // Verify commission rate parameter
         const params = step8Call[1];
-        expect(params).toContain(COMMISSION_RATE_PERCENT);
+        expect(params).toContain(10.00);
 
         // Verify Step 8 is BEFORE COMMIT
         const commitCall = mockClient.query.mock.calls[7];
@@ -396,10 +401,6 @@ describe('Acceptance Service — Step 8 (Order Creation)', () => {
         // Commission formula should reference total_price, not delivery_fee
         expect(step8Sql).toContain('o.total_price * $2 / 100');
         expect(step8Sql).not.toContain('delivery_fee * $');
-    });
-
-    test('COMMISSION_RATE_PERCENT defaults to 10.00', () => {
-        expect(COMMISSION_RATE_PERCENT).toBe(10.00);
     });
 });
 

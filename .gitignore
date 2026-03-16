@@ -44,3 +44,5 @@ Thumbs.db
 
 # Testing
 __snapshots__/
+tmp_*  
+*_output.txt  

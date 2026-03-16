@@ -273,6 +273,16 @@ function stop() {
 }
 
 /**
+ * Check if the cache has been successfully initialized from DB.
+ * Used for fail-fast safety checks in execution layers.
+ * 
+ * @returns {boolean}
+ */
+function isReady() {
+    return _initialized;
+}
+
+/**
  * Get a setting value by key.
  *
  * @param {string} key
@@ -352,4 +362,5 @@ module.exports = {
     isEnabled,
     getSettingMeta,
     getStats,
+    isReady,
 };

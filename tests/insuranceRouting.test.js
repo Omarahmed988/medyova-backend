@@ -85,16 +85,14 @@ describe('Insurance Layer — SQL Structure Validation', () => {
     });
 
     test('non-insured standard query is unchanged', () => {
-        // The original query must still exist for non-insured path
-        // Use individual line checks to avoid CRLF issues
-        expect(routingWorkerSource).toContain('SELECT id FROM pharmacies');
-        expect(routingWorkerSource).toContain('WHERE zone_id = $1');
-        expect(routingWorkerSource).toContain('AND tier_id = $2');
-        expect(routingWorkerSource).toContain('AND is_active = true');
+        // Now uses aliased form with delivery area JOIN
+        expect(routingWorkerSource).toContain('SELECT p.id FROM pharmacies p');
+        expect(routingWorkerSource).toContain('WHERE p.zone_id = $1');
+        expect(routingWorkerSource).toContain('AND p.tier_id = $3');
+        expect(routingWorkerSource).toContain('AND p.is_active = true');
     });
 
     test('non-insured rare query is unchanged', () => {
-        // Use individual line checks to avoid CRLF issues
         expect(routingWorkerSource).toContain('AND supports_rare = true');
         // Verify original rare SELECT still exists (non-aliased)
         const rareMatches = routingWorkerSource.match(/SELECT id FROM pharmacies[\s\S]*?supports_rare = true/g);
@@ -103,9 +101,9 @@ describe('Insurance Layer — SQL Structure Validation', () => {
     });
 
     test('insurance filter uses uip.id parameter (not user_id)', () => {
-        // Standard insured: should use uip.id = $3
-        expect(routingWorkerSource).toContain('uip.id = $3');
-        // Rare insured: should use uip.id = $2
+        // Standard insured: area_id bumped tierId and uip.id to $3/$4
+        expect(routingWorkerSource).toContain('uip.id = $4');
+        // Rare insured: no area_id filter, uip.id remains $2
         expect(routingWorkerSource).toContain('uip.id = $2');
     });
 });

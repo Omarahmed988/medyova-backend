@@ -117,11 +117,10 @@ exports.up = (pgm) => {
         },
     });
 
-    // UNIQUE: (key, scope, scope_id)
-    // Handles NULL scope_id correctly — global flags have scope_id IS NULL
-    pgm.addConstraint('feature_flags', 'uq_feature_flags_key_scope',
-        'UNIQUE (key, scope, COALESCE(scope_id, \'00000000-0000-0000-0000-000000000000\'::uuid))'
-    );
+    pgm.sql(`
+        CREATE UNIQUE INDEX uq_feature_flags_key_scope 
+        ON feature_flags (key, scope, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'::uuid))
+    `);
 
     // ─────────────────────────────────────────────────────
     // 3. Indexes

@@ -23,14 +23,9 @@
  */
 
 const { pool } = require('../config/db');
+const settingsCache = require('../config/settingsCache');
 
-/**
- * Commission rate as a percentage. Configurable via environment variable.
- * Default: 10.00 (10%)
- */
-const COMMISSION_RATE_PERCENT = parseFloat(
-    process.env.COMMISSION_RATE_PERCENT || '10.00'
-);
+
 
 /**
  * Error codes for acceptance failures (Spec v2 §2.4).
@@ -52,6 +47,19 @@ const ERROR_CODES = {
  * @returns {Promise<{success: boolean, idempotent?: boolean, order_id?: string, error_code?: string, message?: string}>}
  */
 async function acceptOffer(requestId, offerId) {
+    // ── Phase 11: Fail-fast validation of critical settings cache ──
+    if (!settingsCache.isReady()) {
+        throw new Error('settingsCache not initialized - cannot proceed with order acceptance.');
+    }
+    const rawComm = settingsCache.getSetting('commission_rate_percent');
+    let commissionRate = 10.00; // Fallback strictly if cache is ready but key is missing
+    if (rawComm !== null) {
+        commissionRate = parseFloat(rawComm);
+        if (isNaN(commissionRate)) {
+            throw new Error(`Invalid commission_rate_percent configured in DB: '${rawComm}'`);
+        }
+    }
+
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -167,7 +175,7 @@ async function acceptOffer(requestId, offerId) {
             JOIN requests r ON r.id = o.request_id
             WHERE o.id = $1
             RETURNING id`,
-            [offerId, COMMISSION_RATE_PERCENT]
+            [offerId, commissionRate]
         );
 
         const orderId = orderResult.rows[0]?.id;
@@ -186,5 +194,4 @@ async function acceptOffer(requestId, offerId) {
 module.exports = {
     acceptOffer,
     ERROR_CODES,
-    COMMISSION_RATE_PERCENT,
 };
